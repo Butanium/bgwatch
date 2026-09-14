@@ -125,3 +125,17 @@ added it although the default would have found the pid).
 the Monitor call the model retypes is ~80 characters shorter; the hint prints the id for
 harness files and a cwd-relative path for a job's own log. `--once` now counts the file's
 lines instead of reporting 0.
+
+## 2026-09-14 — hook ablation
+
+Clément asked whether the hint hook was needed or whether the CLAUDE.md paragraph alone
+does it. Three more whowill arms on the opaque-manifest hang task (n=8): snippet-only
+fable, snippet+hook opus, snippet-only opus. bgwatch in the Monitor call: snippet-only
+5/8 (fable) and 7/8 (opus); with the hook 8/8 for both. Hang noticed: snippet-only fable
+6/8, everything else 8/8. The snippet-only arms produced the two mistakes the hook
+prevents (watching the harness task file while the job wrote its own log; no Monitor at
+all). Decision: keep the hook in the adoption package. Full table in
+`~/.claude/tools/whowill/REPORT.md` ("Ablation").
+
+Also confirmed on the new defaults: hang noticed at a median 3.6–3.9 min in every arm
+running the adaptive-stall bgwatch, versus 10.2 min on the fixed-default one.
