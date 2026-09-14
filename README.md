@@ -53,6 +53,19 @@ job, and Monitor reports bgwatch's own exit if it dies. The one case a cron heal
 still earns its place is a multi-hour babysit that must survive `/clear` or a CLI
 restart, which kill every Monitor with the session.
 
+## Install
+
+```
+git clone https://github.com/Butanium/bgwatch ~/.claude/tools/bgwatch
+ln -s ../../.claude/tools/bgwatch/bgwatch.py ~/.local/bin/bgwatch
+```
+
+Python 3.10+, Linux (`/proc`), no dependencies. The `adoption/` directory holds what makes
+a Claude Code config reach for it: a PostToolUse hook that prints the ready-made
+`Monitor(command="bgwatch …")` call after every background launch (the same hook lives in
+[claude-code-hooks](https://github.com/Butanium/claude-code-hooks)), the settings.json
+fragment that registers it, and a CLAUDE.md paragraph. MIT.
+
 ## Why it exists
 
 Mined from ~12k sessions on 2026-09-14 (see ENGINEERING_LOGS.md): Monitor went from the
