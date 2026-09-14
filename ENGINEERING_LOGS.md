@@ -61,3 +61,37 @@ keep their own case-sensitivity when OR-ed in. Caught by `test_ignore_and_fail_a
 stdin-dumping hook, 2.1.257): `tool_response.backgroundTaskId`, `session_id`, `cwd`,
 `transcript_path` — no output path. It is `<tmp>/claude-<uid>/<cwd slug>/<session>/tasks/<id>.output`
 (slug = cwd with `/` and `.` → `-`); the hint hook globs for it and falls back to the computed path.
+
+## 2026-09-14 (later) — first whowill A/B, and what it changed
+
+Task A (8 control vs 8 treatment fable sessions, 4-min job that prints a traceback at
+65 s, keeps running, exits 0; prompt says "tell me as soon as anything goes wrong"): the
+hook's ready-made call is used 8/8, but control already armed a Monitor 8/8 and reported
+the error within ~1.3 min 8/8 — with an explicit early-warning request this task is a
+ceiling for the current CLAUDE.md. What the treatment removed is the cost: zero
+fallback `sleep && echo` timers (control 6/8, each later needing ToolSearch + TaskStop),
+no hand-written poll loops (control wrote 8 different ones), fewer tool calls (median 9
+vs 11). One control watcher died early (`tail -f --pid=$(pgrep …)` matched the wrong pid);
+the fd-holder detection is exactly what that is for. Full report: `~/.claude/tools/whowill/REPORT.md`.
+Task B (no early-warning request, job hangs) is the discriminating run; results there.
+
+Changes driven by the A/B (dev worktree, merged after the task-B runs finished so the
+PATH copy stayed frozen during the experiment):
+
+- `--pgrep` now excludes bgwatch's whole ancestor chain. The harness runs a Monitor
+  command as `bash -c "source … && bgwatch … --pgrep PAT"`, so the wrapper's own
+  command line matched PAT: 3/8 treatment sessions that added `--pgrep` got a false
+  `[STALL] … alive` after the job had exited. The hint no longer suggests `--pgrep`
+  and says why it isn't needed when the job writes the watched file.
+- Adaptive defaults. Instances overrode `--stall 60` for a 4-minute job because the
+  fixed defaults (10-min heartbeat, 30-min stall) are sized for hour-scale jobs.
+  Now `--every auto` backs off 1→2→4→8→10 min and `--stall auto` is 5× the longest
+  inter-line gap the job has shown, clamped to 1–30 min (30 min before the job has
+  printed twice). Fixed values still accepted. `--poll S` sets the file poll interval,
+  which is also the granularity of the cadence estimate (tests use 0.1).
+- The hint names the job's own log when the command redirects stdout to a file
+  (`> job.log 2>&1`, with a leading `cd DIR &&` resolved): every treatment session
+  re-pointed the hint from the harness task file to `job.log` by hand.
+- `[EXIT]` delivery was briefly suspected lost; it lands in the same instant as the
+  harness completion notification and is absorbed mid-turn (a `queued_command`
+  attachment in the transcript, not a user row). Not a bug.

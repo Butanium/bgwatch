@@ -126,16 +126,32 @@ class PidJob(Job):
         return f"pid {self.pid}"
 
 
+def ancestors(pid: int) -> set[int]:
+    out = set()
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        out.add(pid)
+    return out
+
+
 class PgrepJob(Job):
+    """`pgrep -f` minus bgwatch itself and every ancestor: the harness runs a Monitor
+    command through `bash -c "source … && bgwatch … --pgrep PAT"`, whose own command line
+    contains PAT (found by the first whowill A/B — 3/8 sessions got a false 'alive')."""
+
     kind = "pgrep"
 
     def __init__(self, pattern: str):
         self.pattern = pattern
-        self.me = os.getpid()
+        self.exclude = {os.getpid()} | ancestors(os.getpid())
 
     def alive(self) -> bool:
         out = subprocess.run(["pgrep", "-f", self.pattern], capture_output=True, text=True).stdout
-        pids = {int(p) for p in out.split() if p.strip() and int(p) != self.me and int(p) != os.getppid()}
+        pids = {int(p) for p in out.split() if p.strip()} - self.exclude
         if pids:
             self.seen = True
         return bool(pids)
@@ -191,6 +207,8 @@ class Watcher:
         self.stalled = False
         self.tb_buffer: list[str] | None = None
         self.tail: list[str] = []
+        self.max_gap = 0.0  # longest silence between two lines seen so far
+        self.hb_interval = a.every_min if a.every == "auto" else float(a.every)
 
     def _make_job(self) -> Job:
         a = self.a
@@ -206,8 +224,11 @@ class Watcher:
 
     # ---- line handling
     def _remember(self, line: str) -> None:
+        now = time.monotonic()
+        if self.lines:
+            self.max_gap = max(self.max_gap, now - self.last_write)
         self.lines += 1
-        self.last_write = time.monotonic()
+        self.last_write = now
         if line.strip():
             self.last_line = line
             self.tail.append(line)
@@ -257,6 +278,36 @@ class Watcher:
         if self.match_re and self.match_re.search(line):
             self._emit_match("match", line)
 
+    # ---- adaptive defaults
+    @property
+    def stall_threshold(self) -> float:
+        """Fixed --stall S (0 = off), or auto: silence is a stall when it is 5x the longest
+        gap the job itself has shown, clamped to [--stall-min, --stall-max]. Before the job
+        has printed twice its cadence is unknown, so only --stall-max applies."""
+        a = self.a
+        if a.stall != "auto":
+            return float(a.stall)
+        if self.lines < 2:
+            return a.stall_max
+        return min(max(5 * self.max_gap, a.stall_min), a.stall_max)
+
+    def next_hb_interval(self) -> float:
+        """Fixed --every S, or auto: --every-min doubling each heartbeat up to --every-max,
+        so a 4-minute job gets a heartbeat and a 4-hour job gets one every 10 minutes."""
+        cur = self.hb_interval
+        if self.a.every == "auto":
+            self.hb_interval = min(cur * 2, self.a.every_max)
+        return cur
+
+    def describe_defaults(self) -> str:
+        a = self.a
+        hb = f"{hms(a.every_min)}→{hms(a.every_max)} backoff" if a.every == "auto" else f"every {hms(float(a.every))}"
+        if a.stall == "auto":
+            st = f"auto (5x the job's own cadence, {hms(a.stall_min)}–{hms(a.stall_max)})"
+        else:
+            st = f"after {hms(float(a.stall))}" if float(a.stall) else "off"
+        return f"heartbeat {hb} · stall {st}"
+
     # ---- status lines
     @property
     def elapsed(self) -> float:
@@ -295,11 +346,11 @@ class Watcher:
         detect = "off (no process holds the file; use --pid/--pgrep/--slurm)" if (self.job.kind == "fd-holder" and not self.job.seen) else self.job.describe()
         emit(
             f"[bgwatch] watching {self.path or self.job.describe()} · job-end detection: {detect}"
-            f" · heartbeat every {hms(a.every)}" + (f" · stall after {hms(a.stall)}" if a.stall else "")
+            f" · {self.describe_defaults()}"
         )
         if f and not a.from_start:
             f.seek(0, os.SEEK_END)
-        next_hb = time.monotonic() + a.every
+        next_hb = time.monotonic() + self.next_hb_interval()
         next_job_check = time.monotonic() + a.check_every
         job_alive = alive
         while True:
@@ -320,14 +371,15 @@ class Watcher:
                     if not a.no_exit:
                         return 0
                     self.job = Job()  # keep watching the file, stop asking
-            if a.stall and not self.stalled and now - self.last_write >= a.stall and (job_alive or job_alive is None):
+            thr = self.stall_threshold
+            if thr and not self.stalled and now - self.last_write >= thr and (job_alive or job_alive is None):
                 self.stalled = True
                 emit(self.status("STALL", job_alive, note=f"no output for {hms(now - self.last_write)}"))
             if now >= next_hb:
                 emit(self.status("hb", job_alive if self.job.seen else None))
-                next_hb = now + a.every
+                next_hb = now + self.next_hb_interval()
             if not progressed:
-                time.sleep(POLL_S)
+                time.sleep(a.poll)
 
     def _open_wait(self):
         deadline = time.monotonic() + self.a.grace
@@ -375,7 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
             "drops lines (checked first). `bgwatch --print-defaults` shows the default regex.\n"
             "examples:\n"
             "  bgwatch /tmp/.../tasks/b1.output                     # harness background task\n"
-            "  bgwatch train.log --match 'step \\d+00 ' --every 900   # progress every 100 steps + 15-min heartbeat\n"
+            "  bgwatch train.log --match 'step \\d+00 ' --every 900   # progress every 100 steps, fixed 15-min heartbeat\n"
             "  bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'\n"
             "  bgwatch slurm-44297.out --slurm 44297\n"
             "  bgwatch server.log --pgrep 'vllm serve' --fail 'CUDA|Killed'\n"
@@ -383,8 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("file", nargs="?", help="log / task output file to follow")
-    p.add_argument("--every", type=float, default=600, metavar="S", help="heartbeat interval in seconds (default 600)")
-    p.add_argument("--stall", type=float, default=1800, metavar="S", help="warn when nothing was written for S seconds (default 1800; 0 = off)")
+    p.add_argument("--every", default="auto", metavar="S|auto", help="heartbeat interval in seconds; auto (default) backs off from --every-min to --every-max")
+    p.add_argument("--every-min", type=float, default=60, metavar="S", help="first heartbeat interval in auto mode (default 60)")
+    p.add_argument("--every-max", type=float, default=600, metavar="S", help="heartbeat interval cap in auto mode (default 600)")
+    p.add_argument("--stall", default="auto", metavar="S|auto", help="warn when nothing was written for S seconds (0 = off); auto (default) = 5x the job's longest gap so far, clamped to [--stall-min, --stall-max]")
+    p.add_argument("--stall-min", type=float, default=60, metavar="S", help="auto stall floor (default 60)")
+    p.add_argument("--stall-max", type=float, default=1800, metavar="S", help="auto stall cap, also the threshold before the job has printed twice (default 1800)")
     p.add_argument("--match", metavar="RE", help="also emit lines matching this regex (progress / success markers)")
     p.add_argument("--fail", metavar="RE", default=DEFAULT_FAIL, help="failure regex; replaces the default")
     p.add_argument("--fail-also", metavar="RE", help="extend the failure regex with this alternative")
@@ -398,6 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-rate", type=int, default=20, metavar="N", help="max [fail]/[match] lines per minute (default 20)")
     p.add_argument("--grace", type=float, default=15, metavar="S", help="seconds to wait for the file / the job to appear (default 15)")
     p.add_argument("--check-every", type=float, default=5, metavar="S", help="job liveness poll interval (default 5)")
+    p.add_argument("--poll", type=float, default=POLL_S, metavar="S", help="file poll interval (default 1); also the granularity of the auto stall cadence estimate")
     p.add_argument("--no-exit", action="store_true", help="keep following the file after the job ends")
     p.add_argument("--once", action="store_true", help="print one status line and exit (a poll that isn't a cat)")
     p.add_argument("--print-defaults", action="store_true", help="print the default failure regex and exit")
@@ -415,6 +472,13 @@ def main(argv: list[str] | None = None) -> int:
         a.fail = f"(?:{a.fail})|(?:{a.fail_also})"
     if not a.file and not (a.pid or a.pgrep or a.slurm):
         build_parser().error("give a file to follow, or --pid/--pgrep/--slurm")
+    for name in ("every", "stall"):
+        v = getattr(a, name)
+        if v != "auto":
+            try:
+                float(v)
+            except ValueError:
+                build_parser().error(f"--{name}: expected seconds or 'auto', got {v!r}")
     for name in ("fail", "match", "ignore"):
         pat = getattr(a, name)
         if pat:
