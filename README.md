@@ -4,7 +4,7 @@ The Monitor command for anything long-running. One call, no timeout to guess, no
 get right:
 
 ```
-Monitor(command="bgwatch /path/to/task.output", persistent=true, description="training run")
+Monitor(command="bgwatch bgt3ng9gt", persistent=true, description="training run")   # a harness task id, or any log file
 ```
 
 It follows the file and prints one line per thing worth waking up for. Every stdout line
@@ -22,8 +22,9 @@ is a Monitor notification, so it is deliberately sparse:
 fd 1/2, so bgwatch scans `/proc/*/fd` for the file (verified on the harness's tasks,
 2026-09-14). For jobs that don't hold the file — a slurm job, a server started elsewhere,
 a process that daemonizes — give it `--pid N` or `--slurm JOBID` (authoritative), or `--pgrep PATTERN`, which with a file is only a fallback: the fd-holder scan wins whenever something holds the file, and the pattern is consulted only if nothing does after `--grace`. `--pgrep` ignores bgwatch itself and every ancestor process (the harness runs a Monitor command through a `bash -c` wrapper whose command line contains the pattern).
-If nothing holds the file when bgwatch starts (after `--grace` seconds) it says so and
-keeps watching without an exit condition.
+If nothing holds the file within `--grace` seconds (and no `--pgrep` fallback matches),
+bgwatch exits with code 4 and says so: a watcher that can never see its job end is the
+leaked Monitor this tool exists to prevent. `--no-exit` follows the file regardless.
 
 **Patterns are yours.** `--fail RE` replaces the default failure regex, `--fail-also RE`
 extends it, `--ignore RE` drops lines before any matching, `--no-fail` turns it off.
@@ -35,11 +36,11 @@ case-insensitive, so `error_rate=0.02` and `errors=0` do not match but `Error:` 
 counted and reported once a minute. Each notification costs ~700 chars of context
 (the harness prepends a fixed preamble); the backoff keeps a 4-hour job at ~25 heartbeats.
 
-**Instead of `cat`-ing the file:** `bgwatch --once FILE` prints one status line
-(alive?, lines, last line) and exits.
+**Instead of `cat`-ing the file:** `bgwatch --once FILE|ID` prints one status line
+(alive?, lines, idle, last line) and exits.
 
 ```
-bgwatch /tmp/.../tasks/b1.output                       # harness background task
+bgwatch bgt3ng9gt                                      # harness background task, by id (resolved under the tmp task dirs)
 bgwatch train.log --match 'step \d+00 ' --every 900    # progress every 100 steps + 15-min heartbeat
 bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'
 bgwatch slurm-44297.out --slurm 44297                  # slurm: squeue/sacct decide "ended"

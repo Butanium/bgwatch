@@ -119,3 +119,9 @@ between-arm gaps under ~3/8 are noise.
 Follow-ups taken from the report: heartbeat prints idle time explicitly; `--pgrep` is a
 fallback behind fd-holder detection rather than an override (10/32 treatment sessions
 added it although the default would have found the pid).
+
+**Bare task ids (same day, Clément's question "does the command need the full path?").**
+`bgwatch bgt3ng9gt` resolves a harness task id under `<tmp>/claude-<uid>/*/*/tasks/`, so
+the Monitor call the model retypes is ~80 characters shorter; the hint prints the id for
+harness files and a cwd-relative path for a job's own log. `--once` now counts the file's
+lines instead of reporting 0.

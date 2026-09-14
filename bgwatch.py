@@ -20,7 +20,9 @@ Every stdout line is a notification, so the output is deliberately sparse.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import tempfile
 import re
 import subprocess
 import sys
@@ -35,6 +37,21 @@ DEFAULT_FAIL = (
     r"|exit(ed)? (code|status) [1-9])\b)"
 )
 TRACEBACK_HEAD = re.compile(r"^Traceback \(most recent call last\)")
+TASK_ID_RE = re.compile(r"^[a-z0-9]{6,12}$")
+
+
+def resolve_target(arg: str) -> str:
+    """A bare harness task id (`bgt3ng9gt`) resolves to its output file under
+    <tmp>/claude-<uid>/*/*/tasks/<id>.output, so the Monitor call needs no path."""
+    if TASK_ID_RE.match(arg) and not Path(arg).exists():
+        uid = os.getuid() if hasattr(os, "getuid") else ""
+        hits = glob.glob(os.path.join(tempfile.gettempdir(), f"claude-{uid}", "*", "*", "tasks", f"{arg}.output"))
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            hits.sort(key=os.path.getmtime)
+            return hits[-1]
+    return arg
 LAST_LINE_MAX = 200
 POLL_S = 1.0
 
@@ -191,7 +208,7 @@ class SlurmJob(Job):
 class Watcher:
     def __init__(self, a: argparse.Namespace):
         self.a = a
-        self.path = Path(a.file).expanduser() if a.file else None
+        self.path = Path(resolve_target(a.file)).expanduser() if a.file else None
         self.fail_re = re.compile(a.fail) if a.fail else None
         self.match_re = re.compile(a.match) if a.match else None
         self.ignore_re = re.compile(a.ignore) if a.ignore else None
@@ -351,9 +368,22 @@ class Watcher:
             alive = self.job.alive()
             fallback = " (fallback: no process held the file)"
         if a.once:
+            if f:  # a status line should say how much the job has written so far
+                for line in f:
+                    self._remember(line.rstrip("\n"))
             emit(self.status("status", alive if self.job.seen else None))
             return 0
-        detect = "off (no process holds the file; use --pid/--pgrep/--slurm)" if (self.job.kind == "fd-holder" and not self.job.seen) else self.job.describe() + fallback
+        if self.job.kind in ("fd-holder", "pgrep") and not self.job.seen and not a.no_exit:
+            # A watcher that can never see its job end is the leaked persistent Monitor
+            # this tool exists to prevent, so give up loudly instead of running until TaskStop.
+            emit(
+                f"[EXIT {hms(self.elapsed)}] nothing to watch: no process held {self.path or ''} "
+                f"{'and nothing matched --pgrep ' + repr(a.pgrep) + ' ' if a.pgrep else ''}within {a.grace:g}s. "
+                "If the job already finished, its completion notification has the result; otherwise re-arm "
+                "with --pid/--pgrep/--slurm, or --no-exit to follow the file regardless."
+            )
+            return 4
+        detect = "off (--no-exit: following the file until TaskStop)" if not self.job.seen else self.job.describe() + fallback
         emit(
             f"[bgwatch] watching {self.path or self.job.describe()} · job-end detection: {detect}"
             f" · {self.describe_defaults()}"
@@ -436,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
             "patterns: --fail REPLACES the default failure regex, --fail-also EXTENDS it, --ignore\n"
             "drops lines (checked first). `bgwatch --print-defaults` shows the default regex.\n"
             "examples:\n"
-            "  bgwatch /tmp/.../tasks/b1.output                     # harness background task\n"
+            "  bgwatch bgt3ng9gt                                    # harness background task, by id\n"
             "  bgwatch train.log --match 'step \\d+00 ' --every 900   # progress every 100 steps, fixed 15-min heartbeat\n"
             "  bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'\n"
             "  bgwatch slurm-44297.out --slurm 44297\n"
@@ -444,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  bgwatch --once train.log                             # one status line, then exit"
         ),
     )
-    p.add_argument("file", nargs="?", help="log / task output file to follow")
+    p.add_argument("file", nargs="?", help="log / task output file to follow, or a bare harness task id (resolved under the tmp task dirs)")
     p.add_argument("--every", default="auto", metavar="S|auto", help="heartbeat interval in seconds; auto (default) backs off from --every-min to --every-max")
     p.add_argument("--every-min", type=float, default=60, metavar="S", help="first heartbeat interval in auto mode (default 60)")
     p.add_argument("--every-max", type=float, default=600, metavar="S", help="heartbeat interval cap in auto mode (default 600)")

@@ -68,8 +68,13 @@ def main() -> None:
     cwd = data.get("cwd", "")
     task_file = output_file(data.get("session_id", ""), task_id, cwd)
     log = redirect_target(command, cwd)
-    watch = log or task_file
-    alt = f" (or the harness task file {task_file})" if log else ""
+    if log:
+        rel = os.path.relpath(log, cwd)
+        watch = rel if not rel.startswith("..") else log
+        alt = f" (or the harness task file: bgwatch {task_id})"
+    else:
+        watch = task_id  # bgwatch resolves a bare task id to its output file
+        alt = ""
     hint = (
         f"Background task {task_id} launched. If it runs longer than a couple of minutes, arm its watcher now "
         f"(one call; then keep working or end the turn — do not poll):\n"

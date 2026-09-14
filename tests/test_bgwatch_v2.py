@@ -25,7 +25,7 @@ def test_pgrep_ignores_own_ancestors(tmp_path):
     """The harness runs a Monitor command through `bash -c "... bgwatch ... --pgrep PAT"`:
     that wrapper's command line contains PAT and must not count as the job."""
     log = tmp_path / "job.log"
-    proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "99")
+    proc = start_job(log, "--steps", "20", "--dt", "0.3", "--crash-at", "99")  # ~6 s: outlives the first /proc scan
     # watch a file nobody holds, so the fd-holder scan finds nothing and --pgrep is the fallback
     unheld = tmp_path / "unheld.log"; unheld.write_text("x\n")
     wrapper = f'echo wrapper-mentions fake_job.py >/dev/null; exec {sys.executable} {BGWATCH} {unheld} --pgrep fake_job.py --grace 0.5 --every 60 --stall 0 --check-every 0.3'
@@ -95,11 +95,27 @@ def test_hint_names_redirect_target(tmp_path):
     }
     p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
     ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert f'bgwatch {tmp_path}/sub/logs/train.log"' in ctx, ctx
-    assert "babc123.output" in ctx  # the harness file is still mentioned as the alternative
+    assert 'bgwatch sub/logs/train.log"' in ctx, ctx  # cwd-relative: fewer tokens to retype
+    assert "bgwatch babc123" in ctx  # the harness file is still offered, by id
     assert "no --pid/--pgrep needed" in ctx  # default detection is explained, --pgrep is not suggested
     # no redirect → the harness task output file is the target
     payload["tool_input"]["command"] = "python train.py 2>&1"
     p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
     ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert re.search(r'bgwatch \S*babc123\.output"', ctx), ctx
+    assert 'bgwatch babc123"' in ctx, ctx
+
+
+def test_bare_task_id_resolves(tmp_path, monkeypatch):
+    import os, tempfile
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    tempfile.tempdir = None
+    uid = os.getuid()
+    d = tmp_path / f"claude-{uid}" / "-some-slug" / "sess-9" / "tasks"; d.mkdir(parents=True)
+    log = d / "bq7abc123.output"
+    proc = start_job(log, "--steps", "2", "--dt", "0.2", "--crash-at", "99")
+    p = subprocess.run([sys.executable, str(BGWATCH), "bq7abc123", "--from-start", "--every", "60", "--stall", "0",
+                        "--check-every", "0.3"], capture_output=True, text=True, timeout=30, env={**os.environ, "TMPDIR": str(tmp_path)})
+    proc.wait()
+    lines = p.stdout.splitlines()
+    assert p.returncode == 0 and str(log) in lines[0], lines
+    assert any(l.startswith("[EXIT") for l in lines), lines

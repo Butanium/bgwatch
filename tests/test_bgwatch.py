@@ -89,15 +89,18 @@ def test_once(tmp_path):
     assert "job state unknown" in lines[0]  # nobody holds the file → no claim
 
 
-def test_no_holder_keeps_watching_without_exit(tmp_path):
+def test_no_holder_exits_unless_no_exit(tmp_path):
     log = tmp_path / "job.log"
     log.write_text("hello\n")
-    # nothing holds the file: bgwatch must say detection is off and not exit on its own
-    p = subprocess.Popen([sys.executable, str(BGWATCH), str(log), "--grace", "0.5", "--every", "60", "--stall", "0"],
+    # nothing holds the file: a watcher that can never see the job end must not leak
+    rc, lines = run_watch([str(log), "--grace", "0.5", "--every", "60", "--stall", "0"])
+    assert rc == 4 and lines[0].startswith("[EXIT") and "nothing to watch" in lines[0], lines
+    # --no-exit keeps the old behaviour: follow the file until TaskStop
+    p = subprocess.Popen([sys.executable, str(BGWATCH), str(log), "--grace", "0.5", "--every", "60", "--stall", "0", "--no-exit"],
                          stdout=subprocess.PIPE, text=True)
     first = p.stdout.readline()
     assert "job-end detection: off" in first
-    time.sleep(2)
+    time.sleep(1.5)
     assert p.poll() is None
     p.kill()
 
@@ -133,7 +136,7 @@ def test_hook_hint(tmp_path):
     p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
     out = json.loads(p.stdout)
     ctx = out["hookSpecificOutput"]["additionalContext"]
-    assert 'Monitor(command="bgwatch ' in ctx and "babc123.output" in ctx and "persistent=true" in ctx
+    assert 'Monitor(command="bgwatch babc123"' in ctx and "persistent=true" in ctx
     assert 'description="Train the \'big\' model"' in ctx
     # no hint for sleep timers, subagents, or non-background calls
     for mutate in (
