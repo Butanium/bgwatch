@@ -95,3 +95,27 @@ PATH copy stayed frozen during the experiment):
 - `[EXIT]` delivery was briefly suspected lost; it lands in the same instant as the
   harness completion notification and is absorbed mid-turn (a `queued_command`
   attachment in the transcript, not a user row). Not a bug.
+
+## 2026-09-14 — Task B (hang) results, and the defaults question
+
+Four runs in total (`~/.claude/tools/whowill/REPORT.md`, fable in every arm, n=8 per arm).
+Task B: same job but no early-warning request, a shard error at 65 s and a hang at 150 s
+with no completion notification ever. Control's Monitor use dropped to 3/8 (hang-01) and
+6/8 (hang-02, opaque manifest); the shard error was reported by 5/8 in hang-01 versus
+8/8 in treatment, a median 4.0 min after launch versus 1.2. Across all 32 treatment
+sessions: bgwatch in the Monitor call 32/32 (never verbatim — all re-targeted the job's
+own log), fallback `sleep` timers 0/32 versus 14/32 in control, false completions 0/64.
+
+What did not improve: with the *old* fixed defaults (10-min heartbeat, 30-min stall) both
+arms noticed the hang at ~10 min — treatment from the heartbeat, control from the CLI's
+own `[Monitor timed out — re-arm if needed.]` at its 10-min default, which three control
+sessions per run read as "should be done by now, let me look". Treatment sessions that set
+`--stall 60–120` on their own noticed at 3.5–4.5 min; nothing told them to. The adaptive
+stall merged today (5× the job's longest gap, floor 1 min) would have fired about one
+minute into the hang for this 5-second-cadence job without any flag. Run-to-run variance at
+n=8 is large (control Monitor use 3/8 → 6/8 with only the manifest format changed);
+between-arm gaps under ~3/8 are noise.
+
+Follow-ups taken from the report: heartbeat prints idle time explicitly; `--pgrep` is a
+fallback behind fd-holder detection rather than an override (10/32 treatment sessions
+added it although the default would have found the pid).

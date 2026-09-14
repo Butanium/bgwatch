@@ -14,14 +14,14 @@ is a Monitor notification, so it is deliberately sparse:
 |---|---|
 | `[fail] …` | a line matches the failure regex (Traceback, Error, Killed, OOM, …). A Python traceback is folded into one line: `Traceback → KeyError: 'labels'` |
 | `[match] …` | a line matches your `--match` (progress / success marker) |
-| `[hb 0:10:00] alive · 1234 lines · last: …` | heartbeat; by default the interval backs off 1 → 2 → 4 → 8 → 10 min (`--every S` fixes it, `--every-min/--every-max` bound the backoff) |
+| `[hb 0:10:00] alive · 1234 lines · idle 0:07 · last: …` | heartbeat; by default the interval backs off 1 → 2 → 4 → 8 → 10 min (`--every S` fixes it, `--every-min/--every-max` bound the backoff) |
 | `[STALL no output for 31:00 …]` | silence longer than the job's own cadence: by default 5× the longest gap seen so far, clamped to 1–30 min (`--stall S` fixes it, `0` disables; `--stall-min/--stall-max` bound auto); `[resumed]` when it writes again |
 | `[EXIT 1:23:45] job ended (pid 123) · 5678 lines · 1 fail line seen` + the last `--tail` lines | the job ended. bgwatch exits here, so `persistent: true` never leaks |
 
 **Job end without a PID.** A background task's process holds its output file open on
 fd 1/2, so bgwatch scans `/proc/*/fd` for the file (verified on the harness's tasks,
 2026-09-14). For jobs that don't hold the file — a slurm job, a server started elsewhere,
-a process that daemonizes — give it `--pid N`, `--pgrep PATTERN` or `--slurm JOBID`. `--pgrep` ignores bgwatch itself and every ancestor process (the harness runs a Monitor command through a `bash -c` wrapper whose command line contains the pattern).
+a process that daemonizes — give it `--pid N` or `--slurm JOBID` (authoritative), or `--pgrep PATTERN`, which with a file is only a fallback: the fd-holder scan wins whenever something holds the file, and the pattern is consulted only if nothing does after `--grace`. `--pgrep` ignores bgwatch itself and every ancestor process (the harness runs a Monitor command through a `bash -c` wrapper whose command line contains the pattern).
 If nothing holds the file when bgwatch starts (after `--grace` seconds) it says so and
 keeps watching without an exit condition.
 

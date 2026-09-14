@@ -7,8 +7,8 @@ Follows a log file and prints one line per thing worth waking up for:
 
   [fail]  a line matching the failure pattern (Traceback, Error, Killed, OOM, ...)
   [match] a line matching --match (your progress / success marker)
-  [hb]    a heartbeat every --every seconds: alive?, line count, last line
-  [STALL] nothing written for --stall seconds
+  [hb]    a heartbeat (backing off 1→10 min by default): alive?, line count, idle time, last line
+  [STALL] silence longer than the job's own cadence (or a fixed --stall)
   [EXIT]  the job ended — then bgwatch exits, so `persistent: true` never leaks
 
 Job end is detected without a PID: a background task's process holds its output
@@ -211,15 +211,18 @@ class Watcher:
         self.hb_interval = a.every_min if a.every == "auto" else float(a.every)
 
     def _make_job(self) -> Job:
+        """--pid / --slurm are authoritative. With a file, the fd-holder scan comes first and
+        --pgrep is only the fallback if nothing holds the file after --grace (10/32 A/B
+        sessions passed --pgrep although the scan would have found the pid)."""
         a = self.a
         if a.pid:
             return PidJob(a.pid)
-        if a.pgrep:
-            return PgrepJob(a.pgrep)
         if a.slurm:
             return SlurmJob(a.slurm)
         if self.path:
             return FdHolderJob(self.path)
+        if a.pgrep:
+            return PgrepJob(a.pgrep)
         return Job()
 
     # ---- line handling
@@ -319,6 +322,8 @@ class Watcher:
         parts.append(state)
         if self.path:
             parts.append(f"{self.lines} lines")
+            if self.lines and tag != "STALL":
+                parts.append(f"idle {hms(time.monotonic() - self.last_write)}")
         if self.fail_count:
             parts.append(f"{self.fail_count} fail line{'s' if self.fail_count > 1 else ''} so far")
         if self.last_line:
@@ -340,10 +345,15 @@ class Watcher:
             while time.monotonic() < deadline and not alive:
                 time.sleep(0.5)
                 alive = self.job.alive()
+        fallback = ""
+        if self.job.kind == "fd-holder" and not self.job.seen and a.pgrep:
+            self.job = PgrepJob(a.pgrep)
+            alive = self.job.alive()
+            fallback = " (fallback: no process held the file)"
         if a.once:
             emit(self.status("status", alive if self.job.seen else None))
             return 0
-        detect = "off (no process holds the file; use --pid/--pgrep/--slurm)" if (self.job.kind == "fd-holder" and not self.job.seen) else self.job.describe()
+        detect = "off (no process holds the file; use --pid/--pgrep/--slurm)" if (self.job.kind == "fd-holder" and not self.job.seen) else self.job.describe() + fallback
         emit(
             f"[bgwatch] watching {self.path or self.job.describe()} · job-end detection: {detect}"
             f" · {self.describe_defaults()}"
@@ -447,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fail", action="store_true", help="disable the failure regex entirely (only --match, heartbeats, exit)")
     p.add_argument("--ignore", metavar="RE", help="never emit lines matching this (checked before --fail/--match)")
     p.add_argument("--pid", type=int, help="the job is this pid")
-    p.add_argument("--pgrep", metavar="PATTERN", help="the job is `pgrep -f PATTERN`")
+    p.add_argument("--pgrep", metavar="PATTERN", help="the job is `pgrep -f PATTERN` — with a file, only used if nothing holds the file after --grace")
     p.add_argument("--slurm", metavar="JOBID", help="the job is this slurm job (squeue/sacct)")
     p.add_argument("--from-start", action="store_true", help="scan the existing content too (default: start at the end)")
     p.add_argument("--tail", type=int, default=5, metavar="N", help="lines of tail in the EXIT summary (default 5)")

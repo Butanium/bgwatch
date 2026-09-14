@@ -26,12 +26,36 @@ def test_pgrep_ignores_own_ancestors(tmp_path):
     that wrapper's command line contains PAT and must not count as the job."""
     log = tmp_path / "job.log"
     proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "99")
-    wrapper = f'echo wrapper-mentions fake_job.py >/dev/null; exec {sys.executable} {BGWATCH} {log} --pgrep fake_job.py --from-start --every 60 --stall 0 --check-every 0.3'
+    # watch a file nobody holds, so the fd-holder scan finds nothing and --pgrep is the fallback
+    unheld = tmp_path / "unheld.log"; unheld.write_text("x\n")
+    wrapper = f'echo wrapper-mentions fake_job.py >/dev/null; exec {sys.executable} {BGWATCH} {unheld} --pgrep fake_job.py --grace 0.5 --every 60 --stall 0 --check-every 0.3'
     p = subprocess.run(["bash", "-c", wrapper], capture_output=True, text=True, timeout=30)
     proc.wait()
     lines = p.stdout.splitlines()
     assert p.returncode == 0, lines
+    assert "fallback" in lines[0] and "pgrep" in lines[0], lines
     assert any(l.startswith("[EXIT") for l in lines), lines
+
+
+def test_pgrep_is_only_a_fallback_when_file_is_held(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "2", "--dt", "0.2", "--crash-at", "99")
+    p = subprocess.run([sys.executable, str(BGWATCH), str(log), "--pgrep", "no-such-process-xyz", "--from-start",
+                        "--every", "60", "--stall", "0", "--check-every", "0.3"], capture_output=True, text=True, timeout=30)
+    proc.wait()
+    lines = p.stdout.splitlines()
+    assert "job-end detection: pid" in lines[0], lines  # fd-holder won; the pattern was never consulted
+    assert any(l.startswith("[EXIT") for l in lines), lines
+
+
+def test_heartbeat_reports_idle_time(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "1", "--dt", "3", "--crash-at", "99")
+    p = subprocess.run([sys.executable, str(BGWATCH), str(log), "--from-start", "--every", "1", "--stall", "0",
+                        "--check-every", "0.3"], capture_output=True, text=True, timeout=30)
+    proc.wait()
+    hb = [l for l in p.stdout.splitlines() if l.startswith("[hb ")]
+    assert hb and all(re.search(r"idle \d+:\d\d", l) for l in hb), p.stdout
 
 
 def test_auto_stall_adapts_to_cadence(tmp_path):
