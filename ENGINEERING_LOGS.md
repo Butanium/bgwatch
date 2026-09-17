@@ -157,3 +157,25 @@ never needs to un-ignore it. `--no-default-ignore` is the escape hatch.
 Deliberately kept to this one line. inspect's other always-printed strings that trip the
 failure regex — `WARNING: N of M executed samples had errors`, `Task interrupted` — are
 things you do want woken for.
+
+## 2026-09-16 — `--probe CMD` (opus-5)
+
+Asked for by a session babysitting an Anthropic batch run: the job's real progress signal
+lived in the API, not in its log, so every heartbeat said `alive · 0 lines` and the
+session listed batches by hand through the SDK at each check. `--probe CMD` runs a shell
+command on every status line and appends its output, turning each wake into the number
+the watcher actually wanted.
+
+Decisions:
+
+- Runs inside `status()`, so it rides on `[hb]`, `[STALL]` and `--once` — a stall is
+  exactly when the outside-the-log number matters most. Not on `[EXIT]`: the job is over,
+  a live-state query is likely meaningless there, and that line already carries the tail.
+- Synchronous in the poll loop, capped by `--probe-timeout` (default 45 s). A thread
+  would avoid delaying file reads by up to that much; not worth the machinery for a
+  command that should be a single API call.
+- A probe that exits non-zero or times out reports `probe rc=N: …` / `probe timed out`
+  on the line instead of raising. A broken probe must never kill the watcher — that would
+  trade a missing number for a leaked Monitor.
+- Output is flattened to one line (`·`-joined) and clipped to 160 chars: every stdout line
+  is a notification, so a chatty probe can't blow up the wake.

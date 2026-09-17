@@ -84,6 +84,43 @@ def test_default_ignore_composes_with_user_ignore(tmp_path):
     assert fails == ["[fail] Traceback → KeyError: 'labels'"]  # both ignores applied
 
 
+def test_probe_output_rides_on_status_lines(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "6", "--dt", "0.4", "--crash-at", "9")
+    rc, lines = run_watch([
+        str(log), "--from-start", "--every", "1", "--stall", "0", "--check-every", "0.5",
+        "--probe", "echo 'batches 1 · pending 3/40'",
+    ])
+    proc.wait()
+    assert rc == 0
+    hbs = [l for l in lines if l.startswith("[hb")]
+    assert hbs and all("batches 1 · pending 3/40" in l for l in hbs)
+
+
+def test_probe_failure_is_reported_not_fatal(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "4", "--dt", "0.3", "--crash-at", "9")
+    rc, lines = run_watch([
+        str(log), "--from-start", "--every", "1", "--stall", "0", "--check-every", "0.5",
+        "--probe", "echo nope >&2; exit 3",
+    ])
+    proc.wait()
+    assert rc == 0  # a broken probe never takes the watcher down
+    assert any("probe rc=3: nope" in l for l in lines if l.startswith("[hb"))
+
+
+def test_probe_timeout(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "4", "--dt", "0.3", "--crash-at", "9")
+    rc, lines = run_watch([
+        str(log), "--from-start", "--every", "1", "--stall", "0", "--check-every", "0.5",
+        "--probe", "sleep 30", "--probe-timeout", "0.5",
+    ])
+    proc.wait()
+    assert rc == 0
+    assert any("probe timed out after 0.5s" in l for l in lines)
+
+
 def test_no_fail_only_match(tmp_path):
     log = tmp_path / "job.log"
     proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "1")

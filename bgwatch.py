@@ -8,6 +8,7 @@ Follows a log file and prints one line per thing worth waking up for:
   [fail]  a line matching the failure pattern (Traceback, Error, Killed, OOM, ...)
   [match] a line matching --match (your progress / success marker)
   [hb]    a heartbeat (backing off 1→10 min by default): alive?, line count, idle time, last line
+          (+ the output of --probe CMD, for progress that lives outside the log)
   [STALL] silence longer than the job's own cadence (or a fixed --stall)
   [EXIT]  the job ended — then bgwatch exits, so `persistent: true` never leaks
 
@@ -56,6 +57,7 @@ def resolve_target(arg: str) -> str:
             return hits[-1]
     return arg
 LAST_LINE_MAX = 200
+PROBE_MAX = 160
 POLL_S = 1.0
 
 
@@ -329,12 +331,32 @@ class Watcher:
             st = f"auto (5x the job's own cadence, {hms(a.stall_min)}–{hms(a.stall_max)})"
         else:
             st = f"after {hms(float(a.stall))}" if float(a.stall) else "off"
-        return f"heartbeat {hb} · stall {st}"
+        probe = f" · probe {a.probe!r} (timeout {a.probe_timeout:g}s)" if a.probe else ""
+        return f"heartbeat {hb} · stall {st}{probe}"
 
     # ---- status lines
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.t0
+
+    def probe(self) -> str | None:
+        """--probe CMD, run on every status line: for a job whose real progress signal is not
+        in its log (an API-side batch, a queue depth), so each wake carries a number instead
+        of `0 lines`. Blocks the poll loop for up to --probe-timeout."""
+        if not self.a.probe:
+            return None
+        try:
+            p = subprocess.run(
+                self.a.probe, shell=True, capture_output=True, text=True, timeout=self.a.probe_timeout
+            )
+        except subprocess.TimeoutExpired:
+            return f"probe timed out after {self.a.probe_timeout:g}s"
+        except Exception as e:  # a probe must never take the watcher down with it
+            return f"probe failed: {e}"
+        out = " · ".join(l.strip() for l in (p.stdout + p.stderr).splitlines() if l.strip())
+        if p.returncode != 0:
+            return clip(f"probe rc={p.returncode}" + (f": {out}" if out else ""), PROBE_MAX)
+        return clip(out, PROBE_MAX) or None
 
     def status(self, tag: str, alive: bool | None, note: str = "") -> str:
         state = {True: "alive", False: "ended", None: "job state unknown"}[alive]
@@ -346,6 +368,9 @@ class Watcher:
                 parts.append(f"idle {hms(time.monotonic() - self.last_write)}")
         if self.fail_count:
             parts.append(f"{self.fail_count} fail line{'s' if self.fail_count > 1 else ''} so far")
+        probe = self.probe()
+        if probe:
+            parts.append(probe)
         if self.last_line:
             parts.append(f"last: {clip(self.last_line)}")
         return f"[{tag} {hms(self.elapsed)}] " + " · ".join(parts)
@@ -473,6 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  bgwatch bgt3ng9gt                                    # harness background task, by id\n"
             "  bgwatch train.log --match 'step \\d+00 ' --every 900   # progress every 100 steps, fixed 15-min heartbeat\n"
             "  bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'\n"
+            "  bgwatch batch.log --probe 'python batch_status.py'   # each wake carries the API-side count\n"
             "  bgwatch slurm-44297.out --slurm 44297\n"
             "  bgwatch server.log --pgrep 'vllm serve' --fail 'CUDA|Killed'\n"
             "  bgwatch --once train.log                             # one status line, then exit"
@@ -491,6 +517,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fail", action="store_true", help="disable the failure regex entirely (only --match, heartbeats, exit)")
     p.add_argument("--ignore", metavar="RE", help="never emit lines matching this (checked before --fail/--match); extends the default ignore list")
     p.add_argument("--no-default-ignore", action="store_true", help="drop the built-in ignore list (keeps --ignore)")
+    p.add_argument("--probe", metavar="CMD", help="shell command run on every status line; its output is appended to the line (for progress that lives outside the log — an API-side batch, a queue depth)")
+    p.add_argument("--probe-timeout", type=float, default=45, metavar="S", help="kill a --probe that takes longer than this (default 45)")
     p.add_argument("--pid", type=int, help="the job is this pid")
     p.add_argument("--pgrep", metavar="PATTERN", help="the job is `pgrep -f PATTERN` — with a file, only used if nothing holds the file after --grace")
     p.add_argument("--slurm", metavar="JOBID", help="the job is this slurm job (squeue/sacct)")

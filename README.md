@@ -34,6 +34,13 @@ case-insensitive, so `error_rate=0.02` and `errors=0` do not match but `Error:` 
 wording trips the failure regex — currently inspect_ai's `requests
 (pending/completed/failed): 3/40/0` batch-status poll; `--no-default-ignore` drops it.
 
+**Progress that isn't in the log.** `--probe CMD` runs a shell command on every status
+line (`[hb]`, `[STALL]`, `--once`) and appends its output, so each wake carries a number
+instead of `alive · 0 lines` — a batch's pending count from the provider's API, a queue
+depth, `nvidia-smi` utilisation. It blocks the poll loop for up to `--probe-timeout`
+(default 45 s); a probe that fails or times out says so on the line and never stops the
+watcher.
+
 **Volume.** `--max-rate N` (default 20/min) caps `[fail]`/`[match]` lines; the excess is
 counted and reported once a minute. Each notification costs ~700 chars of context
 (the harness prepends a fixed preamble); the backoff keeps a 4-hour job at ~25 heartbeats.
@@ -45,6 +52,7 @@ counted and reported once a minute. Each notification costs ~700 chars of contex
 bgwatch bgt3ng9gt                                      # harness background task, by id (resolved under the tmp task dirs)
 bgwatch train.log --match 'step \d+00 ' --every 900    # progress every 100 steps + 15-min heartbeat
 bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'
+bgwatch batch.log --probe 'python batch_status.py'     # every wake carries the API-side pending count
 bgwatch slurm-44297.out --slurm 44297                  # slurm: squeue/sacct decide "ended"
 bgwatch server.log --pgrep 'vllm serve' --fail 'CUDA|Killed'
 bgwatch --once train.log
