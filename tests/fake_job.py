@@ -14,10 +14,13 @@ p.add_argument("--dt", type=float, default=0.5)
 p.add_argument("--crash-at", type=int, default=5)
 p.add_argument("--stall", type=float, default=0, help="seconds of silence after the crash")
 p.add_argument("--exit-code", type=int, default=0)
+p.add_argument("--inspect-noise", action="store_true", help="also print inspect_ai's batch-status line each step")
 a = p.parse_args()
 
 for step in range(1, a.steps + 1):
     print(f"step {step}/{a.steps} loss=0.{100 - step:02d} error_rate=0.01", flush=True)
+    if a.inspect_noise:
+        print(f"Current batches: 1, requests (pending/completed/failed): {a.steps - step}/{step}/0, oldest batch age: 0:01", flush=True)
     if step == a.crash_at:
         print("Traceback (most recent call last):", flush=True)
         print('  File "train.py", line 88, in <module>', flush=True)

@@ -28,9 +28,11 @@ leaked Monitor this tool exists to prevent. `--no-exit` follows the file regardl
 
 **Patterns are yours.** `--fail RE` replaces the default failure regex, `--fail-also RE`
 extends it, `--ignore RE` drops lines before any matching, `--no-fail` turns it off.
-`bgwatch --print-defaults` prints the default. The default is word-bounded and
+`bgwatch --print-defaults` prints the defaults. The failure default is word-bounded and
 case-insensitive, so `error_rate=0.02` and `errors=0` do not match but `Error:` and
-`loss=nan` do.
+`loss=nan` do. `--ignore` extends a small default ignore list of always-benign lines whose
+wording trips the failure regex — currently inspect_ai's `requests
+(pending/completed/failed): 3/40/0` batch-status poll; `--no-default-ignore` drops it.
 
 **Volume.** `--max-rate N` (default 20/min) caps `[fail]`/`[match]` lines; the excess is
 counted and reported once a minute. Each notification costs ~700 chars of context

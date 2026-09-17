@@ -139,3 +139,21 @@ all). Decision: keep the hook in the adoption package. Full table in
 
 Also confirmed on the new defaults: hang noticed at a median 3.6–3.9 min in every arm
 running the adaptive-stall bgwatch, versus 10.2 min on the fixed-default one.
+
+## 2026-09-16 — a default ignore list (opus-5)
+
+Clément: `--ignore "pending/completed/failed"` "is always there with inspect", make it a
+default. The line is inspect_ai's batch-status poll, `print()`ed to stdout from
+`model/_providers/util/batch_log.py`: `Current batches: 2, requests
+(pending/completed/failed): 120/45/0, oldest batch age: 5m 12s`. Its `failed` token is
+word-bounded so it hits DEFAULT_FAIL on every poll — a recurring `[fail]` notification
+for a healthy run, which is the exact noise `--max-rate` then hides real failures behind.
+
+`DEFAULT_IGNORE` is the literal `pending/completed/failed`, and `--ignore` EXTENDS it
+(unlike `--fail`, which replaces). Asymmetric on purpose: the default ignore list is
+known-benign noise, not a policy the caller is meant to re-state, and a user pattern
+never needs to un-ignore it. `--no-default-ignore` is the escape hatch.
+
+Deliberately kept to this one line. inspect's other always-printed strings that trip the
+failure regex — `WARNING: N of M executed samples had errors`, `Task interrupted` — are
+things you do want woken for.

@@ -36,6 +36,9 @@ DEFAULT_FAIL = (
     r"|command not found|no such file|permission denied|cancelled|slurmstepd"
     r"|exit(ed)? (code|status) [1-9])\b)"
 )
+# Always-benign lines whose wording trips DEFAULT_FAIL. inspect_ai prints
+# "requests (pending/completed/failed): 3/40/0" on every batch-status poll.
+DEFAULT_IGNORE = r"pending/completed/failed"
 TRACEBACK_HEAD = re.compile(r"^Traceback \(most recent call last\)")
 TASK_ID_RE = re.compile(r"^[a-z0-9]{6,12}$")
 
@@ -464,7 +467,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "patterns: --fail REPLACES the default failure regex, --fail-also EXTENDS it, --ignore\n"
-            "drops lines (checked first). `bgwatch --print-defaults` shows the default regex.\n"
+            "drops lines (checked first) and EXTENDS a small default ignore list.\n"
+            "`bgwatch --print-defaults` shows both defaults.\n"
             "examples:\n"
             "  bgwatch bgt3ng9gt                                    # harness background task, by id\n"
             "  bgwatch train.log --match 'step \\d+00 ' --every 900   # progress every 100 steps, fixed 15-min heartbeat\n"
@@ -485,7 +489,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fail", metavar="RE", default=DEFAULT_FAIL, help="failure regex; replaces the default")
     p.add_argument("--fail-also", metavar="RE", help="extend the failure regex with this alternative")
     p.add_argument("--no-fail", action="store_true", help="disable the failure regex entirely (only --match, heartbeats, exit)")
-    p.add_argument("--ignore", metavar="RE", help="never emit lines matching this (checked before --fail/--match)")
+    p.add_argument("--ignore", metavar="RE", help="never emit lines matching this (checked before --fail/--match); extends the default ignore list")
+    p.add_argument("--no-default-ignore", action="store_true", help="drop the built-in ignore list (keeps --ignore)")
     p.add_argument("--pid", type=int, help="the job is this pid")
     p.add_argument("--pgrep", metavar="PATTERN", help="the job is `pgrep -f PATTERN` — with a file, only used if nothing holds the file after --grace")
     p.add_argument("--slurm", metavar="JOBID", help="the job is this slurm job (squeue/sacct)")
@@ -497,19 +502,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--poll", type=float, default=POLL_S, metavar="S", help="file poll interval (default 1); also the granularity of the auto stall cadence estimate")
     p.add_argument("--no-exit", action="store_true", help="keep following the file after the job ends")
     p.add_argument("--once", action="store_true", help="print one status line and exit (a poll that isn't a cat)")
-    p.add_argument("--print-defaults", action="store_true", help="print the default failure regex and exit")
+    p.add_argument("--print-defaults", action="store_true", help="print the default failure / ignore regexes and exit")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     a = build_parser().parse_args(argv)
     if a.print_defaults:
-        print(DEFAULT_FAIL)
+        print(f"--fail   {DEFAULT_FAIL}")
+        print(f"--ignore {DEFAULT_IGNORE}")
         return 0
     if a.no_fail:
         a.fail = None
     elif a.fail_also:
         a.fail = f"(?:{a.fail})|(?:{a.fail_also})"
+    if not a.no_default_ignore:
+        a.ignore = f"(?:{DEFAULT_IGNORE})|(?:{a.ignore})" if a.ignore else DEFAULT_IGNORE
     if not a.file and not (a.pid or a.pgrep or a.slurm):
         build_parser().error("give a file to follow, or --pid/--pgrep/--slurm")
     for name in ("every", "stall"):

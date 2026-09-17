@@ -57,6 +57,33 @@ def test_ignore_and_fail_also_and_match(tmp_path):
     assert "[match] done" in lines
 
 
+def test_default_ignore_drops_inspect_batch_status(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "9", "--inspect-noise")
+    rc, lines = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.5"])
+    proc.wait()
+    assert rc == 0
+    assert not any(l.startswith("[fail]") for l in lines)
+
+    proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "9", "--inspect-noise")
+    rc, lines = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.5", "--no-default-ignore"])
+    proc.wait()
+    assert any(l.startswith("[fail] Current batches:") for l in lines)
+
+
+def test_default_ignore_composes_with_user_ignore(tmp_path):
+    log = tmp_path / "job.log"
+    proc = start_job(log, "--steps", "4", "--dt", "0.2", "--crash-at", "2", "--inspect-noise")
+    rc, lines = run_watch([
+        str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.5",
+        "--ignore", "ERROR: eval",
+    ])
+    proc.wait()
+    assert rc == 0
+    fails = [l for l in lines if l.startswith("[fail]")]
+    assert fails == ["[fail] Traceback → KeyError: 'labels'"]  # both ignores applied
+
+
 def test_no_fail_only_match(tmp_path):
     log = tmp_path / "job.log"
     proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "1")
