@@ -179,3 +179,63 @@ Decisions:
   trade a missing number for a leaked Monitor.
 - Output is flattened to one line (`·`-joined) and clipped to 160 chars: every stdout line
   is a notification, so a chatty probe can't blow up the wake.
+
+## 2026-09-25 — in-the-wild evaluation and the fixes it drove (opus-5-5)
+
+An independent evaluation read every background launch in the archive from 08-01 to 09-25
+(2,126 jobs; all 86 long work jobs read by eye), report at
+`~/claude-playgrounds/archive-sweep-09-25/bgwatch-eval/report.md`. Verdict: more jobs are
+watched (long work jobs with a Monitor 6/48 → 32/38) and watchers end with their jobs, but
+waiting got more expensive (about 12 idle wakes per watched long job) and three blind spots
+produced the worst episodes. Changes, each replayed against the real logs still on disk
+(213 files, 109k lines; scripts `replay_regex.py`, `replay_hint.py` next to the report):
+
+- *Log-shaped failure default.* Bare case-insensitive words fired on echoed model output,
+  test names and code listings. Replay, distinct matched lines hand-labelled: old default
+  329 matches = 135 real + 194 false; new 166 = 144 real + 22 false (the remaining false ones
+  are CamelCase exception names inside echoed code, e.g. `raise ValueError(...)` in a
+  generated answer, plus one Playwright teardown `TargetClosedError`). Lines only the old
+  default caught that were real: 6 (`[ELIFECYCLE] Test failed.`, `failed: <names>`,
+  `Failed Tests 1`), each in a file where the new default still fires on the same failure
+  (`1 failed`, `Failed:`, `FAILED`), so no job's failure goes unreported. Lines only the new
+  default catches that are real: 15, mostly exception lines printed outside a Python
+  traceback (`RuntimeError: 0 valid draws…`, `IndexError: 2`) — `\berror\b` never matched
+  `IndexError`. Classes kept on purpose although rare in the corpus: segfault / core dumped,
+  command not found, no such file or directory, permission denied, slurmstepd / CANCELLED,
+  `exit code N`, `timed out`, `Sample error` (inspect).
+- *Default ignore list* grows by four always-benign shapes that the new default would still
+  match: Modal's "Timed out waiting for final app logs", glog W/I-level lines (torch prints a
+  "Traceback" inside warnings), rich-box source lines (`│ ❱ 550 │ raise …`), and the harness's
+  `[exited with code N]` trailer (the completion notice and `[EXIT]` already carry it).
+- *ANSI stripped* before matching and display (vitest colour codes hid `Error:` from `^`).
+- *Stall floor 60 → 180 s.* Replay on the 11 auto `[STALL]`s in the archive: 2 were real
+  hangs (8.8 and 10 min of silence) and still fire, 2 min later; 9 were benign pauses, of which
+  3 (silences of 118, 119 s and one unknown) no longer fire and 6 (210–411 s) still do. A
+  300 s floor would have dropped 3 more, at 4 min later detection; left at 180 for now. The
+  cadence ratchet (one long gap raises the auto threshold to the 30-min cap) is unchanged:
+  replaying it needs per-line timestamps the archive doesn't have.
+- *Young jobs read from the top.* Instances arm the Monitor a median 5 s (p90 19 s) after the
+  launch, and bgwatch started at the end of the file: a typecheck failure printed in those
+  seconds was never reported (51e9ec87:778). Now, when the file's holder started under 2 min
+  ago and the file holds only this job's output (a harness task file, or a holder that did not
+  open it O_APPEND — the harness opens task files O_APPEND, a `>` redirect doesn't, `>>` does),
+  reading starts at the top.
+- *Wrong-file pointer.* Blind watches (task id watched while the command redirected to its
+  own log, every heartbeat "0 lines") were the costliest misuse: one session made about 40
+  manual checks and 15 sleep timers. While the watched file stays empty, the first status line
+  names the regular files the job's process tree has open for writing, once.
+- *`--every 0`* turns heartbeats off (an instance wanted a watcher that "wakes on stop/failure
+  only" and got 12 heartbeat wakes). `[resumed]` now reads "new output after M:SS of silence
+  (the job is still running)" — it was read as "the batch returned" once. Heartbeats say
+  "N new lines (file had X kB before bgwatch attached)" when the file wasn't empty.
+
+Hint hook (both copies): the target parser ignored quoting and heredocs and didn't expand
+variables, so 161 of 574 real hints (28%) named an unusable file (`bgwatch :`, `bgwatch {`,
+`bgwatch $SD/push.log`), and opus instances fell back to the task id, which is empty when the
+command redirects. Now heredoc bodies and quoted strings are skipped, `cat > f` / `echo … > f`
+style writes don't count, `NAME=value` set earlier in the command (and the environment) are
+expanded, and a target that still has a `$` produces an explicit "give its absolute path, not
+the task id" instead of a broken call. Replay over the full commands: unusable targets
+161 → 4 (3 of them now carry that explicit instruction). The alternative "(or the harness task
+file)" is replaced by the reason not to use it, and the hint says servers and tunnels need no
+watcher.

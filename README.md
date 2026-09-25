@@ -12,10 +12,10 @@ is a Monitor notification, so it is deliberately sparse:
 
 | line | when |
 |---|---|
-| `[fail] …` | a line matches the failure regex (Traceback, Error, Killed, OOM, …). A Python traceback is folded into one line: `Traceback → KeyError: 'labels'` |
+| `[fail] …` | a line looks like a failure report (a Traceback, `KeyError: …`, `ERROR`, `FAILED`, `error: …`, `2 failed`, `Killed`, OOM, …). A Python traceback is folded into one line: `Traceback → KeyError: 'labels'` |
 | `[match] …` | a line matches your `--match` (progress / success marker) |
-| `[hb 0:10:00] alive · 1234 lines · idle 0:07 · last: …` | heartbeat; by default the interval backs off 1 → 2 → 4 → 8 → 10 min (`--every S` fixes it, `--every-min/--every-max` bound the backoff) |
-| `[STALL no output for 31:00 …]` | silence longer than the job's own cadence: by default 5× the longest gap seen so far, clamped to 1–30 min (`--stall S` fixes it, `0` disables; `--stall-min/--stall-max` bound auto); `[resumed]` when it writes again |
+| `[hb 0:10:00] alive · 1234 lines · idle 0:07 · last: …` | heartbeat; by default the interval backs off 1 → 2 → 4 → 8 → 10 min (`--every S` fixes it, `--every 0` turns it off, `--every-min/--every-max` bound the backoff). While the watched file stays empty it also names any other file the job has open for writing — the usual cause is a task-id watch on a command that redirects to its own log |
+| `[STALL no output for 31:00 …]` | silence longer than the job's own cadence: by default 5× the longest gap seen so far, clamped to 3–30 min (`--stall S` fixes it, `0` disables; `--stall-min/--stall-max` bound auto); `[resumed]` when it writes again |
 | `[EXIT 1:23:45] job ended (pid 123) · 5678 lines · 1 fail line seen` + the last `--tail` lines | the job ended. bgwatch exits here, so `persistent: true` never leaks |
 
 **Job end without a PID.** A background task's process holds its output file open on
@@ -28,11 +28,21 @@ leaked Monitor this tool exists to prevent. `--no-exit` follows the file regardl
 
 **Patterns are yours.** `--fail RE` replaces the default failure regex, `--fail-also RE`
 extends it, `--ignore RE` drops lines before any matching, `--no-fail` turns it off.
-`bgwatch --print-defaults` prints the defaults. The failure default is word-bounded and
-case-insensitive, so `error_rate=0.02` and `errors=0` do not match but `Error:` and
-`loss=nan` do. `--ignore` extends a small default ignore list of always-benign lines whose
-wording trips the failure regex — currently inspect_ai's `requests
-(pending/completed/failed): 3/40/0` batch-status poll; `--no-default-ignore` drops it.
+`bgwatch --print-defaults` prints the defaults. The failure default is log-shaped: a line
+has to look like a failure report, not merely contain a word, so echoed model output ("the
+main error is…", `return NaN;`), test names and `2 passed, 0 failed` stay quiet while
+`KeyError: …`, `ERROR`, `FAILED tests/…`, `error TS2322:`, `3 passed, 2 failed`, `Killed`
+and `loss=nan` fire. ANSI colour codes are stripped before matching. `--ignore` extends a
+small default ignore list of always-benign lines that would still match: inspect_ai's
+batch-status poll, Modal's "Timed out waiting for final app logs", glog warning-level lines
+(torch/vLLM workers print tracebacks inside warnings), source lines inside a rich traceback
+box, and the harness's `[exited with code N]` trailer; `--no-default-ignore` drops it.
+
+**Where reading starts.** At the end of the file, except when the job started under two
+minutes ago and the file holds only its output (a harness task file, or a `>` redirect rather
+than `>>`): then from the top, so a failure printed in the seconds before the Monitor was
+armed is not skipped. `--from-start` forces the top. Heartbeats count lines since bgwatch
+attached and say how much the file held before.
 
 **Progress that isn't in the log.** `--probe CMD` runs a shell command on every status
 line (`[hb]`, `[STALL]`, `--once`) and appends its output, so each wake carries a number

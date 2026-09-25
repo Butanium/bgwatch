@@ -29,17 +29,47 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from stat import S_ISREG as stat_is_reg
 
-# Scoped (?i:...) rather than a global (?i) so the pattern can be OR-ed with --fail-also.
+# Log-shaped rather than bare words: a line has to look like a failure report, not merely
+# mention one. Bare case-insensitive words (error, killed, nan, failure …) fired on every
+# echoed model output, test name and code listing in the 2026-09-25 archive replay; each
+# alternative below keeps a failure class that replay found in real logs. Case-insensitive
+# parts are scoped (?i:…) so the pattern can be OR-ed with --fail-also.
 DEFAULT_FAIL = (
-    r"(?i:\b(traceback|error|exception|failed|failure|fatal|killed|oom|out of memory"
-    r"|segmentation fault|core dumped|cuda error|assert(ion)?|nan|timed? ?out"
-    r"|command not found|no such file|permission denied|cancelled|slurmstepd"
-    r"|exit(ed)? (code|status) [1-9])\b)"
+    r"Traceback \(most recent call last\)"            # Python, also inside rich boxes / grep output
+    r"|\b[A-Z]\w*(Error|Exception)\b"                  # KeyError, TimeoutError, torch.OutOfMemoryError …
+    r"|^\s*(Error|Fatal):"                              # JS / CLI "Error: …" at line start
+    r"|\b(ERROR|FATAL|CRITICAL)\b"                      # upper-case log levels
+    r"|\bFAILED\b(?!:?\s*(none|0)\b)|\bFailed:"          # pytest / script verdicts, not "FAILED: none"
+    r"|\b(error|fatal)( [A-Z]+\d+)?:"                   # "error: …", "fatal: …", "error TS2322:"
+    r"|\b[1-9]\d* (failed|errors?)\b(?!:?\s*(none|0)\b)" # non-zero failure counts, not "0 failed"
+    r"|\bSample error\b"                                # inspect_ai per-sample errors
+    r"|(?i:\bfailed with\b)"                            # "Runner failed with exception", "Command failed with exit code 1"
+    r"|\bKilled\b|SIGKILL|SIGSEGV|SIGABRT"
+    r"|(?i:out of memory|\boom\b|segmentation fault|core dumped|cuda error|\btimed out\b)"
+    r"|(?i:\b(loss|grad_?norm)\w*\s*[=:]\s*nan\b|\bnan (loss|detected|encountered)\b)"
+    r"|(?i:command not found|no such file or directory|permission denied)"
+    r"|slurmstepd|\bCANCELLED\b"
+    r"|(?i:\bexit(ed)? (with )?(code|status):? [1-9])"
 )
-# Always-benign lines whose wording trips DEFAULT_FAIL. inspect_ai prints
-# "requests (pending/completed/failed): 3/40/0" on every batch-status poll.
-DEFAULT_IGNORE = r"pending/completed/failed"
+# Always-benign lines whose wording trips DEFAULT_FAIL:
+# - inspect_ai's batch-status poll, "requests (pending/completed/failed): 3/40/0"
+# - Modal's client, after a detached run: "Timed out waiting for final app logs."
+# - glog/absl warning- and info-level lines (torch, vLLM workers), which print a
+#   "Traceback (most recent call last)" as part of a warning
+# - source lines inside a rich traceback box ("│ ❱ 550 │ raise RemoteError(…"): the box's
+#   "Traceback" header and its final exception line already carry the failure
+# - the harness's own "[exited with code N]" trailer: the completion notification and the
+#   [EXIT] line already report it, and 143/144 mean the job was stopped on purpose
+DEFAULT_IGNORE = (
+    r"pending/completed/failed"
+    r"|Timed out waiting for final app logs"
+    r"|\b[IW]\d{4} \d\d:\d\d:\d\d\.\d+\s+\d+ \S+:\d+\]"
+    r"|^│\s+(❱\s+)?\d+ │"
+    r"|^\[exited with code \d+\]$"
+)
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TRACEBACK_HEAD = re.compile(r"^Traceback \(most recent call last\)")
 TASK_ID_RE = re.compile(r"^[a-z0-9]{6,12}$")
 
@@ -59,6 +89,36 @@ def resolve_target(arg: str) -> str:
 LAST_LINE_MAX = 200
 PROBE_MAX = 160
 POLL_S = 1.0
+
+
+def process_age(pid: int) -> float | None:
+    """Seconds since `pid` started, from /proc/<pid>/stat field 22 and /proc/uptime."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            start_ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def fd_flags(pid: int, fd: str) -> int | None:
+    try:
+        with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+            for line in f:
+                if line.startswith("flags:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+O_APPEND = 0o2000
+# files a job writes that are data, not its log (for the "the job is writing X" pointer)
+NOT_A_LOG = (".eval", ".db", ".sqlite", ".sqlite3", "-journal", "-wal", ".pt", ".bin", ".safetensors",
+             ".parquet", ".arrow", ".npy", ".npz", ".zip", ".tar", ".gz", ".png", ".jpg", ".mp4", ".lock")
+YOUNG_JOB_S = 120
 
 
 def hms(seconds: float) -> str:
@@ -103,6 +163,7 @@ class FdHolderJob(Job):
         self.target = str(path.resolve())
         self.me = os.getpid()
         self.pids: set[int] = set()
+        self.appends = False  # some holder opened the file with O_APPEND (`>>`, or the harness)
 
     def alive(self) -> bool:
         pids = set()
@@ -115,6 +176,9 @@ class FdHolderJob(Job):
                     try:
                         if os.readlink(fd) == self.target:
                             pids.add(pid)
+                            flags = fd_flags(pid, fd.name)
+                            if flags is not None and flags & O_APPEND:
+                                self.appends = True
                             break
                     except OSError:
                         continue
@@ -127,6 +191,52 @@ class FdHolderJob(Job):
 
     def describe(self) -> str:
         return f"pid {min(self.pids)}" if self.pids else "no process holds the file"
+
+    def age(self) -> float | None:
+        ages = [a for a in (process_age(p) for p in self.pids) if a is not None]
+        return max(ages) if ages else None
+
+    def other_writes(self, limit: int = 2) -> list[str]:
+        """Regular files the job's process tree has open for writing, other than the watched
+        one: where the output went when the watched file stays empty (a task-id watch on a
+        command that redirects to its own log)."""
+        children: dict[int, list[int]] = {}
+        for stat in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                ppid = int(stat.read_text().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children.setdefault(ppid, []).append(int(stat.parent.name))
+        todo, tree = list(self.pids), set()
+        while todo:
+            pid = todo.pop()
+            if pid not in tree:
+                tree.add(pid)
+                todo.extend(children.get(pid, []))
+        found: dict[str, float] = {}
+        for pid in tree:
+            try:
+                fds = list(Path(f"/proc/{pid}/fd").iterdir())
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    path = os.readlink(fd)
+                except OSError:
+                    continue
+                if (not path.startswith("/") or path == self.target or path.startswith(("/dev/", "/proc/"))
+                        or path.endswith(NOT_A_LOG)):
+                    continue
+                flags = fd_flags(pid, fd.name)
+                if flags is None or not flags & 0o3:  # O_WRONLY | O_RDWR
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if stat_is_reg(st.st_mode):
+                    found[path] = st.st_mtime
+        return sorted(found, key=found.get, reverse=True)[:limit]
 
 
 class PidJob(Job):
@@ -231,6 +341,8 @@ class Watcher:
         self.tail: list[str] = []
         self.max_gap = 0.0  # longest silence between two lines seen so far
         self.hb_interval = a.every_min if a.every == "auto" else float(a.every)
+        self.bytes_before = 0  # file content already there when we attached at its end
+        self.pointed_elsewhere = False
 
     def _make_job(self) -> Job:
         """--pid / --slurm are authoritative. With a file, the fd-holder scan comes first and
@@ -250,6 +362,7 @@ class Watcher:
     # ---- line handling
     def _remember(self, line: str) -> None:
         now = time.monotonic()
+        self.silence_start = self.last_write
         if self.lines:
             self.max_gap = max(self.max_gap, now - self.last_write)
         self.lines += 1
@@ -261,7 +374,8 @@ class Watcher:
                 self.tail.pop(0)
         if self.stalled:
             self.stalled = False
-            emit(f"[resumed {hms(self.elapsed)}] output resumed · {clip(line)}")
+            emit(f"[resumed {hms(self.elapsed)}] new output after {hms(now - self.silence_start)} of silence "
+                 f"(the job is still running) · {clip(line)}")
 
     def _rate_ok(self) -> bool:
         now = time.monotonic()
@@ -280,6 +394,7 @@ class Watcher:
             emit(f"[{tag}] {clip(text)}")
 
     def handle(self, line: str) -> None:
+        line = ANSI_RE.sub("", line)
         self._remember(line)
         if self.tb_buffer is not None:
             # inside a traceback: frames are indented; first flush-left line is the exception
@@ -320,13 +435,18 @@ class Watcher:
         """Fixed --every S, or auto: --every-min doubling each heartbeat up to --every-max,
         so a 4-minute job gets a heartbeat and a 4-hour job gets one every 10 minutes."""
         cur = self.hb_interval
+        if cur <= 0:
+            return float("inf")  # --every 0: heartbeats off
         if self.a.every == "auto":
             self.hb_interval = min(cur * 2, self.a.every_max)
         return cur
 
     def describe_defaults(self) -> str:
         a = self.a
-        hb = f"{hms(a.every_min)}→{hms(a.every_max)} backoff" if a.every == "auto" else f"every {hms(float(a.every))}"
+        if a.every == "auto":
+            hb = f"{hms(a.every_min)}→{hms(a.every_max)} backoff"
+        else:
+            hb = f"every {hms(float(a.every))}" if float(a.every) > 0 else "off"
         if a.stall == "auto":
             st = f"auto (5x the job's own cadence, {hms(a.stall_min)}–{hms(a.stall_max)})"
         else:
@@ -363,9 +483,17 @@ class Watcher:
         parts = [note] if note else []
         parts.append(state)
         if self.path:
-            parts.append(f"{self.lines} lines")
+            if self.bytes_before:
+                parts.append(f"{self.lines} new lines (file had {self.bytes_before / 1000:.1f} kB before bgwatch attached)")
+            else:
+                parts.append(f"{self.lines} lines")
             if self.lines and tag != "STALL":
                 parts.append(f"idle {hms(time.monotonic() - self.last_write)}")
+            if not self.lines and alive and isinstance(self.job, FdHolderJob) and not self.pointed_elsewhere:
+                elsewhere = self.job.other_writes()
+                if elsewhere:
+                    self.pointed_elsewhere = True  # say it once
+                    parts.append(f"nothing written here yet; the job has {', '.join(elsewhere)} open for writing — if that is its log, re-arm bgwatch on it")
         if self.fail_count:
             parts.append(f"{self.fail_count} fail line{'s' if self.fail_count > 1 else ''} so far")
         probe = self.probe()
@@ -416,8 +544,9 @@ class Watcher:
             f"[bgwatch] watching {self.path or self.job.describe()} · job-end detection: {detect}"
             f" · {self.describe_defaults()}"
         )
-        if f and not a.from_start:
+        if f and not (a.from_start or self._fresh_output()):
             f.seek(0, os.SEEK_END)
+            self.bytes_before = f.tell()
         next_hb = time.monotonic() + self.next_hb_interval()
         next_job_check = time.monotonic() + a.check_every
         job_alive = alive
@@ -448,6 +577,19 @@ class Watcher:
                 next_hb = now + self.next_hb_interval()
             if not progressed:
                 time.sleep(a.poll)
+
+    def _fresh_output(self) -> bool:
+        """The job started moments ago and the file holds only its output (a harness task file,
+        or a `>` redirect rather than `>>`): read it from the top, since instances arm the watcher
+        a few seconds after the launch and an early failure would otherwise be skipped."""
+        job = self.job
+        if not (isinstance(job, FdHolderJob) and job.seen):
+            return False
+        age = job.age()
+        if age is None or age > YOUNG_JOB_S:
+            return False
+        task_file = self.path.parent.name == "tasks" and self.path.suffix == ".output"
+        return task_file or not job.appends
 
     def _open_wait(self):
         deadline = time.monotonic() + self.a.grace
@@ -505,11 +647,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("file", nargs="?", help="log / task output file to follow, or a bare harness task id (resolved under the tmp task dirs)")
-    p.add_argument("--every", default="auto", metavar="S|auto", help="heartbeat interval in seconds; auto (default) backs off from --every-min to --every-max")
+    p.add_argument("--every", default="auto", metavar="S|auto", help="heartbeat interval in seconds (0 = off); auto (default) backs off from --every-min to --every-max")
     p.add_argument("--every-min", type=float, default=60, metavar="S", help="first heartbeat interval in auto mode (default 60)")
     p.add_argument("--every-max", type=float, default=600, metavar="S", help="heartbeat interval cap in auto mode (default 600)")
     p.add_argument("--stall", default="auto", metavar="S|auto", help="warn when nothing was written for S seconds (0 = off); auto (default) = 5x the job's longest gap so far, clamped to [--stall-min, --stall-max]")
-    p.add_argument("--stall-min", type=float, default=60, metavar="S", help="auto stall floor (default 60)")
+    p.add_argument("--stall-min", type=float, default=180, metavar="S", help="auto stall floor (default 180)")
     p.add_argument("--stall-max", type=float, default=1800, metavar="S", help="auto stall cap, also the threshold before the job has printed twice (default 1800)")
     p.add_argument("--match", metavar="RE", help="also emit lines matching this regex (progress / success markers)")
     p.add_argument("--fail", metavar="RE", default=DEFAULT_FAIL, help="failure regex; replaces the default")
@@ -522,7 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pid", type=int, help="the job is this pid")
     p.add_argument("--pgrep", metavar="PATTERN", help="the job is `pgrep -f PATTERN` — with a file, only used if nothing holds the file after --grace")
     p.add_argument("--slurm", metavar="JOBID", help="the job is this slurm job (squeue/sacct)")
-    p.add_argument("--from-start", action="store_true", help="scan the existing content too (default: start at the end)")
+    p.add_argument("--from-start", action="store_true", help="scan the existing content too (default: from the top when the job started under 2 min ago and the file holds only its output, else from the end)")
     p.add_argument("--tail", type=int, default=5, metavar="N", help="lines of tail in the EXIT summary (default 5)")
     p.add_argument("--max-rate", type=int, default=20, metavar="N", help="max [fail]/[match] lines per minute (default 20)")
     p.add_argument("--grace", type=float, default=15, metavar="S", help="seconds to wait for the file / the job to appear (default 15)")

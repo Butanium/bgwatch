@@ -66,7 +66,9 @@ def test_default_ignore_drops_inspect_batch_status(tmp_path):
     assert not any(l.startswith("[fail]") for l in lines)
 
     proc = start_job(log, "--steps", "3", "--dt", "0.2", "--crash-at", "9", "--inspect-noise")
-    rc, lines = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.5", "--no-default-ignore"])
+    # the ignore list, not the failure regex, is what drops it: a user --fail that matches it fires without the list
+    rc, lines = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.5",
+                           "--fail", "failed", "--no-default-ignore"])
     proc.wait()
     assert any(l.startswith("[fail] Current batches:") for l in lines)
 
@@ -178,7 +180,7 @@ def test_pid_mode(tmp_path):
 
 def test_rate_limit(tmp_path):
     log = tmp_path / "job.log"
-    log.write_text("".join(f"Error {i}\n" for i in range(30)))
+    log.write_text("".join(f"Error: {i}\n" for i in range(30)))
     proc = subprocess.Popen(["sleep", "1"], stdout=open(log, "a"))  # a short-lived holder
     rc, lines = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.3", "--max-rate", "5"])
     proc.wait()
