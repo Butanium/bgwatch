@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 
 def output_file(session_id: str, task_id: str, cwd: str) -> str:
     uid = os.getuid() if hasattr(os, "getuid") else ""
@@ -89,50 +90,170 @@ def redirect_target(command: str, cwd: str) -> tuple[str | None, str | None]:
     return os.path.normpath(os.path.join(base, target)), raw
 
 
-def main() -> None:
-    data = json.load(sys.stdin)
-    if data.get("tool_name") != "Bash":
-        return
-    agent_id = data.get("agent_id", "")
-    if agent_id and "@" not in agent_id:  # subagent
-        return
-    resp = data.get("tool_response") or {}
-    task_id = resp.get("backgroundTaskId") if isinstance(resp, dict) else None
-    if not task_id:
-        return
-    tool_input = data.get("tool_input") or {}
-    command = (tool_input.get("command") or "").lstrip()
-    if command.startswith("sleep ") or command.startswith("bgwatch"):
-        return  # a timer or a watcher is not a job to watch
-    desc = (tool_input.get("description") or "background job").replace('"', "'")
-    cwd = data.get("cwd", "")
-    task_file = output_file(data.get("session_id", ""), task_id, cwd)
+def monitor_lifetime() -> tuple[str, str]:
+    return "persistent=true", ""
+
+
+def toolsearch_note() -> str:
+    return " Monitor is a deferred tool — `ToolSearch select:Monitor` first if it isn't loaded."
+
+
+DEFER_S = 120  # an auto-backgrounded command gets its hint only if it is still running by then
+PENDING_MAX_S = 6 * 3600
+
+
+def state_file(session_id: str) -> str:
+    uid = os.getuid() if hasattr(os, "getuid") else ""
+    return os.path.join(tempfile.gettempdir(), f"claude-{uid}", "bgwatch_hint", f"{session_id or 'no-session'}.json")
+
+
+def load_state(session_id: str) -> dict:
+    try:
+        with open(state_file(session_id)) as f:
+            state = json.load(f)
+        if isinstance(state, dict):
+            return {"full_shown": bool(state.get("full_shown")), "pending": list(state.get("pending") or [])}
+    except (OSError, ValueError):
+        pass
+    return {"full_shown": False, "pending": []}
+
+
+def save_state(session_id: str, state: dict) -> None:
+    path = state_file(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def held_open(path: str) -> bool:
+    """Some process holds `path` open, i.e. the background task that writes it is still running."""
+    target = os.path.realpath(path)
+    for fd_dir in glob.glob("/proc/[0-9]*/fd"):
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) == target:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def already_watched(task_id: str, watch: str) -> bool:
+    """A bgwatch process already follows this task, by id or by the file it writes."""
+    names = {task_id, os.path.basename(watch)}
+    for cmdline in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(cmdline, "rb") as f:
+                args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if any(os.path.basename(a) in ("bgwatch", "bgwatch.py") for a in args[:2]):
+            if any(os.path.basename(a) in names for a in args[1:]):
+                return True
+    return False
+
+
+def watch_target(command: str, cwd: str, task_id: str) -> tuple[str, str, str | None]:
+    """(what to pass bgwatch, kind, raw redirect text); kind is task / redirect / unresolved."""
     log, raw = redirect_target(command, cwd)
-    lead = f"Background task {task_id} launched."
     if log:
         rel = os.path.relpath(log, cwd)
-        watch = rel if not rel.startswith("..") else log
-        alt = f"; not `bgwatch {task_id}`, whose task file only gets what the redirect doesn't catch"
-    elif raw:
-        watch = f"<absolute path of {raw}>"
-        lead += (f" Its stdout goes to `{raw}`, which this hook can't resolve: give bgwatch that file's absolute path, "
-                 f"not the task id, whose file stays empty when stdout is redirected.")
-        alt = ""
+        return (rel if not rel.startswith("..") else log), "redirect", raw
+    if raw:
+        return f"<absolute path of {raw}>", "unresolved", raw
+    return task_id, "task", None
+
+
+def render(t: dict, full: bool, deferred_min: float | None = None) -> str:
+    """The hint for one task `t` (keys: task, watch, kind, raw, desc). The first hint of a session
+    explains bgwatch; later ones are one line, since the explanation is already in context."""
+    task, watch, kind, raw, desc = t["task"], t["watch"], t["kind"], t.get("raw"), t["desc"]
+    lifetime, cap_note = monitor_lifetime()
+    call = f'Monitor(command="bgwatch {watch}", {lifetime}, description="{desc}")'
+    if deferred_min is not None:
+        lead = (f"Background task {task} (\"{desc}\"), moved to the background at the sync timeout, is still "
+                f"running after {deferred_min:.0f} min.")
     else:
-        watch = task_id  # bgwatch resolves a bare task id to its output file
-        alt = ""
-    hint = (
-        f"{lead} If it runs longer than a couple of minutes, arm its watcher now "
-        f"(one call; then keep working or end the turn — do not poll):\n"
-        f'  Monitor(command="bgwatch {watch}", persistent=true, description="{desc}")\n'
+        lead = f"Background task {task} launched."
+    unresolved = (f" Its stdout goes to `{raw}`, which this hook can't resolve: give bgwatch that file's absolute "
+                  f"path, not the task id, whose file stays empty when stdout is redirected.") if kind == "unresolved" else ""
+    if not full:
+        redirect = " (the job's own log, not the task file)" if kind == "redirect" else ""
+        when = "If you want to hear about failures before it ends" if deferred_min is not None else "If it runs past a couple of minutes"
+        return f"{lead}{unresolved} {when}: {call}{redirect}.{cap_note}"
+    alt = f"; not `bgwatch {task}`, whose task file only gets what the redirect doesn't catch" if kind == "redirect" else ""
+    when = ("Arm its watcher now if you want to hear about failures before it ends"
+            if deferred_min is not None else "If it runs longer than a couple of minutes, arm its watcher now")
+    return (
+        f"{lead}{unresolved} {when} (one call; then keep working or end the turn — do not poll):\n"
+        f"  {call}\n"
         f"bgwatch wakes you for failure lines, a heartbeat that backs off from 1 to 10 min, silence longer than "
         f"the job's own output cadence, and the job's exit (detected because the job holds that file open — "
         f"no --pid/--pgrep needed when the job writes the watched file{alt}); then it exits itself. "
         f"Add --match RE for a progress marker, --ignore RE / --fail-also RE to tune patterns (`bgwatch --help`). "
-        f"Not needed for a job that ends in seconds (the completion notification covers it), nor for a server or tunnel, which isn't meant to end. "
-        f"Monitor is a deferred tool — `ToolSearch select:Monitor` first if it isn't loaded."
+        f"Not needed for a job that ends in seconds (the completion notification covers it), nor for a server or "
+        f"tunnel, which isn't meant to end. Later launches in this session get a one-line hint."
+        + cap_note + toolsearch_note()
     )
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": hint}}))
+
+
+def main() -> None:
+    data = json.load(sys.stdin)
+    if data.get("tool_name") != "Bash":
+        return
+    if data.get("agent_id") and "@" not in data["agent_id"]:  # subagent: can't wait on a Monitor
+        return
+    session = data.get("session_id", "")
+    cwd = data.get("cwd", "")
+    state = load_state(session)
+    changed, out, now = False, [], time.time()
+
+    # Auto-backgrounded commands (the sync timeout moved them) mostly end within a minute or two,
+    # so their hint waits until one is still running DEFER_S after its start. Hooks only run on
+    # tool calls, so it is delivered with the first Bash call after that point.
+    keep = []
+    for t in state["pending"]:
+        age = now - t["started"]
+        if age < DEFER_S:
+            keep.append(t)
+            continue
+        changed = True
+        if age < PENDING_MAX_S and held_open(t["task_file"]) and not already_watched(t["task"], t["watch"]):
+            out.append(render(t, full=not state["full_shown"], deferred_min=age / 60))
+            state["full_shown"] = True
+    state["pending"] = keep
+
+    resp = data.get("tool_response") or {}
+    task_id = resp.get("backgroundTaskId") if isinstance(resp, dict) else None
+    tool_input = data.get("tool_input") or {}
+    command = (tool_input.get("command") or "").lstrip()
+    if task_id and not (command.startswith("sleep ") or command.startswith("bgwatch")):  # timers and watchers aren't jobs
+        desc = (tool_input.get("description") or "background job").replace('"', "'")
+        watch, kind, raw = watch_target(command, cwd, task_id)
+        t = {"task": task_id, "watch": watch, "kind": kind, "raw": raw, "desc": desc}
+        timed_out_ms = resp.get("timedOutAfterMs") if isinstance(resp, dict) else None
+        if timed_out_ms or not tool_input.get("run_in_background"):
+            t.update(started=now - (timed_out_ms or 0) / 1000,
+                     task_file=output_file(session, task_id, cwd))
+            state["pending"].append(t)
+        else:
+            out.append(render(t, full=not state["full_shown"]))
+            state["full_shown"] = True
+        changed = True
+
+    if changed:
+        try:
+            save_state(session, state)
+        except OSError:
+            pass  # a lost state file only means a repeated full hint
+    if out:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n\n".join(out)}}))
 
 
 if __name__ == "__main__":

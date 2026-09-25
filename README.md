@@ -82,7 +82,9 @@ ln -s ../../.claude/tools/bgwatch/bgwatch.py ~/.local/bin/bgwatch
 
 Python 3.10+, Linux (`/proc`), no dependencies. The `adoption/` directory holds what makes
 a Claude Code config reach for it: a PostToolUse hook that prints the ready-made
-`Monitor(command="bgwatch …")` call after every background launch (the same hook lives in
+`Monitor(command="bgwatch …")` call after a background launch — with the explanation the
+first time in a session and as one line after that, and for a command the sync timeout
+moved to the background only once it has run 2 minutes (the same hook lives in
 [claude-code-hooks](https://github.com/Butanium/claude-code-hooks)), the settings.json
 fragment that registers it, and a CLAUDE.md paragraph. MIT.
 

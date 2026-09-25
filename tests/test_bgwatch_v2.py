@@ -14,6 +14,14 @@ FAKE_JOB = HERE / "fake_job.py"
 HOOK = HERE.parent / "adoption" / "hooks" / "bgwatch_hint.py"
 
 
+def hook_env(tmp_path):
+    """The hint hook keeps per-session state under TMPDIR; each call gets a fresh one, so every
+    call sees a first-in-session (full) hint."""
+    import os, uuid
+    d = tmp_path / uuid.uuid4().hex[:8]; d.mkdir()
+    return {**os.environ, "TMPDIR": str(d)}
+
+
 def start_job(log: Path, *job_args):
     f = open(log, "w")
     proc = subprocess.Popen([sys.executable, str(FAKE_JOB), *job_args], stdout=f, stderr=subprocess.STDOUT)
@@ -93,14 +101,14 @@ def test_hint_names_redirect_target(tmp_path):
         "tool_input": {"command": "cd sub && python train.py --epochs 3 > logs/train.log 2>&1", "description": "Train", "run_in_background": True},
         "tool_response": {"stdout": "", "stderr": "", "backgroundTaskId": "babc123"},
     }
-    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
+    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True, env=hook_env(tmp_path))
     ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
     assert 'bgwatch sub/logs/train.log"' in ctx, ctx  # cwd-relative: fewer tokens to retype
     assert "bgwatch babc123" in ctx  # the harness file is still offered, by id
     assert "no --pid/--pgrep needed" in ctx  # default detection is explained, --pgrep is not suggested
     # no redirect → the harness task output file is the target
     payload["tool_input"]["command"] = "python train.py 2>&1"
-    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
+    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True, env=hook_env(tmp_path))
     ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
     assert 'bgwatch babc123"' in ctx, ctx
 

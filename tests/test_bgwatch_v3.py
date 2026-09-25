@@ -139,13 +139,28 @@ def test_resumed_says_the_job_is_still_running(tmp_path):
 HOOK = HERE.parent / "adoption" / "hooks" / "bgwatch_hint.py"
 
 
-def hint_for(command, tmp_path):
+def call_hook(tmp_path, command, session="sess-1", task="babc123", background=True, timed_out_ms=None):
+    """Run the hint hook once; state lives under TMPDIR=tmp_path. Returns the injected text or ''."""
     import json
-    payload = {"session_id": "sess-1", "cwd": str(tmp_path), "tool_name": "Bash",
-               "tool_input": {"command": command, "description": "job", "run_in_background": True},
-               "tool_response": {"stdout": "", "stderr": "", "backgroundTaskId": "babc123"}}
-    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
-    return json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
+    resp = {"stdout": "", "stderr": ""}
+    if task:
+        resp["backgroundTaskId"] = task
+    if timed_out_ms:
+        resp["timedOutAfterMs"] = timed_out_ms
+    tool_input = {"command": command, "description": "job"}
+    if background:
+        tool_input["run_in_background"] = True
+    payload = {"session_id": session, "cwd": str(tmp_path), "tool_name": "Bash", "tool_input": tool_input, "tool_response": resp}
+    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True,
+                       env={**os.environ, "TMPDIR": str(tmp_path)})
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"] if p.stdout.strip() else ""
+
+
+def hint_for(command, tmp_path):
+    """The full (first-in-session) hint for `command`, in a fresh session."""
+    import uuid
+    return call_hook(tmp_path, command, session=f"s-{uuid.uuid4().hex[:8]}")
 
 
 def test_hint_ignores_heredocs_quotes_and_file_writers(tmp_path):
@@ -175,3 +190,65 @@ def test_hint_says_so_when_a_variable_cannot_be_resolved(tmp_path):
 
 def test_hint_mentions_servers(tmp_path):
     assert "server or tunnel" in hint_for("python train.py", tmp_path)
+
+
+def state_path(tmp_path, session):
+    return tmp_path / f"claude-{os.getuid()}" / "bgwatch_hint" / f"{session}.json"
+
+
+def test_full_hint_once_per_session_then_one_line(tmp_path):
+    first = call_hook(tmp_path, "python a.py", session="s1", task="bfirst001")
+    assert "bgwatch wakes you for failure lines" in first and "one-line hint" in first
+    second = call_hook(tmp_path, "python b.py > logs/b.log 2>&1", session="s1", task="bsecond02")
+    assert second.count("\n") == 0 and len(second) < 250, second
+    assert 'Monitor(command="bgwatch logs/b.log"' in second and "the job's own log, not the task file" in second
+    assert "bgwatch wakes you" in call_hook(tmp_path, "python c.py", session="s2", task="bthird003")  # a new session
+
+
+def test_auto_backgrounded_command_waits_for_two_minutes(tmp_path):
+    import json
+    assert call_hook(tmp_path, "make build", session="s3", task="bauto0003", background=False, timed_out_ms=60000) == ""
+    st = json.loads(state_path(tmp_path, "s3").read_text())
+    assert [t["task"] for t in st["pending"]] == ["bauto0003"]
+    assert call_hook(tmp_path, "ls", session="s3", task=None, background=False) == ""  # still young: nothing yet
+
+
+def _age_pending(tmp_path, session, task_file, seconds=130):
+    import json
+    path = state_path(tmp_path, session)
+    st = json.loads(path.read_text())
+    for t in st["pending"]:
+        t["started"] -= seconds
+        t["task_file"] = str(task_file)
+    path.write_text(json.dumps(st))
+
+
+def test_deferred_hint_when_still_running(tmp_path):
+    call_hook(tmp_path, "make build", session="s4", task="bauto0004", background=False, timed_out_ms=60000)
+    out = tmp_path / "bauto0004.output"
+    holder = subprocess.Popen(["sleep", "20"], stdout=open(out, "w"))
+    try:
+        _age_pending(tmp_path, "s4", out)
+        ctx = call_hook(tmp_path, "ls", session="s4", task=None, background=False)
+        assert "bauto0004" in ctx and re.search(r"still running after \d+ min", ctx), ctx
+        assert call_hook(tmp_path, "ls", session="s4", task=None, background=False) == ""  # delivered once
+    finally:
+        holder.kill()
+
+
+def test_no_deferred_hint_when_finished_or_already_watched(tmp_path):
+    call_hook(tmp_path, "make build", session="s5", task="bauto0005", background=False, timed_out_ms=60000)
+    done = tmp_path / "done.output"; done.write_text("ok\n")  # nobody holds it: the job ended
+    _age_pending(tmp_path, "s5", done)
+    assert call_hook(tmp_path, "ls", session="s5", task=None, background=False) == ""
+
+    call_hook(tmp_path, "make build", session="s6", task="bauto0006", background=False, timed_out_ms=60000)
+    out = tmp_path / "bauto0006.output"
+    holder = subprocess.Popen(["sleep", "20"], stdout=open(out, "w"))
+    watcher = subprocess.Popen(["bash", "-c", "exec -a bgwatch python3 -c 'import time; time.sleep(20)' bauto0006"])
+    try:
+        time.sleep(0.3)
+        _age_pending(tmp_path, "s6", out)
+        assert call_hook(tmp_path, "ls", session="s6", task=None, background=False) == ""
+    finally:
+        holder.kill(); watcher.kill()

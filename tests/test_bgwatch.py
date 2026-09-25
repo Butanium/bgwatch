@@ -14,6 +14,14 @@ FAKE_JOB = HERE / "fake_job.py"
 HOOK = HERE.parent / "adoption" / "hooks" / "bgwatch_hint.py"
 
 
+def hook_env(tmp_path):
+    """The hint hook keeps per-session state under TMPDIR; each call gets a fresh one, so every
+    call sees a first-in-session (full) hint."""
+    import os, uuid
+    d = tmp_path / uuid.uuid4().hex[:8]; d.mkdir()
+    return {**os.environ, "TMPDIR": str(d)}
+
+
 def run_watch(args, timeout=40):
     p = subprocess.run([sys.executable, str(BGWATCH), *args], capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout.splitlines()
@@ -101,7 +109,7 @@ def test_probe_output_rides_on_status_lines(tmp_path):
 
 def test_probe_failure_is_reported_not_fatal(tmp_path):
     log = tmp_path / "job.log"
-    proc = start_job(log, "--steps", "4", "--dt", "0.3", "--crash-at", "9")
+    proc = start_job(log, "--steps", "8", "--dt", "0.4", "--crash-at", "9")  # outlives the 1 s heartbeat under load
     rc, lines = run_watch([
         str(log), "--from-start", "--every", "1", "--stall", "0", "--check-every", "0.5",
         "--probe", "echo nope >&2; exit 3",
@@ -113,7 +121,7 @@ def test_probe_failure_is_reported_not_fatal(tmp_path):
 
 def test_probe_timeout(tmp_path):
     log = tmp_path / "job.log"
-    proc = start_job(log, "--steps", "4", "--dt", "0.3", "--crash-at", "9")
+    proc = start_job(log, "--steps", "8", "--dt", "0.4", "--crash-at", "9")  # outlives the 1 s heartbeat under load
     rc, lines = run_watch([
         str(log), "--from-start", "--every", "1", "--stall", "0", "--check-every", "0.5",
         "--probe", "sleep 30", "--probe-timeout", "0.5",
@@ -199,7 +207,7 @@ def test_hook_hint(tmp_path):
         "tool_input": {"command": "python train.py", "description": "Train the \"big\" model", "run_in_background": True},
         "tool_response": {"stdout": "", "stderr": "", "backgroundTaskId": "babc123"},
     }
-    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True)
+    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True, env=hook_env(tmp_path))
     out = json.loads(p.stdout)
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert 'Monitor(command="bgwatch babc123"' in ctx and "persistent=true" in ctx
@@ -211,5 +219,5 @@ def test_hook_hint(tmp_path):
         lambda d: d["tool_response"].pop("backgroundTaskId"),
     ):
         d = json.loads(json.dumps(payload)); mutate(d)
-        p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(d), capture_output=True, text=True)
+        p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(d), capture_output=True, text=True, env=hook_env(tmp_path))
         assert p.stdout.strip() == ""

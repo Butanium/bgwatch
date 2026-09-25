@@ -239,3 +239,27 @@ the task id" instead of a broken call. Replay over the full commands: unusable t
 161 → 4 (3 of them now carry that explicit instruction). The alternative "(or the harness task
 file)" is replaced by the reason not to use it, and the hint says servers and tunnels need no
 watcher.
+
+## 2026-09-25 (later) — the hint's own volume
+
+The hint injected about 1,000 characters on every background launch: 572 launches in 60
+sessions since 09-14, most of them jobs that end within a minute or two. Two changes, in both
+copies of the hook, replayed over those sessions (`replay_hint_volume.py` next to the
+evaluation report):
+
+- The full explanation goes out on the first launch of a session. Later launches get one line
+  that still carries the exact Monitor call, the resolved target and, for a redirect, the
+  reason not to use the task id. Per-session state is a small JSON file in
+  `<tmp>/claude-<uid>/bgwatch_hint/`; losing it only repeats the full hint.
+- A command that the sync timeout moved to the background, rather than one launched with
+  `run_in_background`, gets no hint at launch. Replay: 68 of 76 such commands ended within
+  2 min of starting. If it is still running 2 min after it started (its task file is still held
+  open) and no bgwatch process already names it, the hint rides on the next Bash call.
+
+Result: characters injected went from 577k to 166k (29%). Of the 8 auto-backgrounded commands
+that ran past 2 min, 5 would get the deferred hint, a mean 149 s after they started. The other
+3 saw no Bash call before they ended. None of the 8 had a watcher armed under the old hint.
+
+Gap: hooks only run on tool calls, so a deferred hint can't reach an idle model. The job's
+completion notification still does. What the replay can't show is whether the one-line form
+keeps adoption as high as the full hint did; a whowill arm would measure that.
