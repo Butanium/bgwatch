@@ -252,3 +252,19 @@ def test_no_deferred_hint_when_finished_or_already_watched(tmp_path):
         assert call_hook(tmp_path, "ls", session="s6", task=None, background=False) == ""
     finally:
         holder.kill(); watcher.kill()
+
+
+def test_replay_fail_regex_reports_one_sided_lines(tmp_path):
+    import json
+    (tmp_path / "a.log").write_text("step 1\nKeyError: 'x'\nthe main error is the verb\n")
+    (tmp_path / "b.log").write_text("all good, 0 errors\n")
+    dump = tmp_path / "diff.jsonl"
+    p = subprocess.run([sys.executable, str(HERE.parent / "replay" / "fail_regex.py"), "--no-task-files",
+                        "--files", str(tmp_path / "*.log"), "--baseline-fail", r"(?i:\berrors?\b)",
+                        "--fail", r"\b[A-Z]\w{0,60}Error\b", "--ignore", "^$", "--dump", str(dump)],
+                       capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, p.stderr
+    rows = [json.loads(l) for l in dump.read_text().splitlines()]
+    assert {(r["side"], r["line"]) for r in rows} == {
+        ("baseline-only", "the main error is the verb"), ("baseline-only", "all good, 0 errors"), ("candidate-only", "KeyError: 'x'")}
+    assert "files where only the baseline fires (1)" in p.stdout and "b.log" in p.stdout

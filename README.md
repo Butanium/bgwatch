@@ -98,6 +98,23 @@ had a grep without `--line-buffered` (matches never delivered), 9% matched only 
 success path. The four decisions a hand-written watcher needs — pattern, buffering,
 timeout, exit condition — are what instances skipped. bgwatch makes them defaults.
 
+## Changing the defaults
+
+Every `[fail]` wakes the model, so check a change to `DEFAULT_FAIL` / `DEFAULT_IGNORE` against
+real logs before shipping it:
+
+```
+python3 replay/fail_regex.py --baseline HEAD                       # working tree vs last commit
+python3 replay/fail_regex.py --baseline HEAD --files '/var/tmp/*.log' --dump diff.jsonl
+python3 replay/fail_regex.py --fail 'Traceback|Error:' --files train.log   # try a --fail on one log
+```
+
+It replays both regexes over every harness task file still on disk (plus `--files`). It prints
+the lines only one side matches and the files where only one side fires at all. Label them by
+hand: a regex can't tell a real failure from a false alarm. The 2026-09-25 numbers in
+ENGINEERING_LOGS.md came from this, and so did the method: count real and false matches on
+each side, and check that every file with a real failure still fires.
+
 ## Tests
 
 ```
