@@ -276,3 +276,30 @@ Both are now alternatives (`^[\w.-]+: .*\bfailed\b`, `['"]error['"]\s*:\s*['"]`)
 against the previous default (`replay/fail_regex.py --baseline main`): +5 real lines, 0 false,
 0 lines lost. `Terminated` was tried and dropped: 1 real hit (a command killed by `timeout`,
 which the exit code already reports) against 3 intentional `pkill`s of helper processes.
+
+## 2026-09-25 (night) — restart continuity instead of a live `ctl`
+
+Clément asked whether bgwatch needs a way to change parameters mid-job. Full study:
+`~/claude-playgrounds/archive-sweep-09-25/bgwatch-eval/live-params/`.
+
+What the archive showed (09-14 → 09-25):
+- 19 stop-and-re-arm restarts on the same target, in 5 sessions. 16 of them changed flags,
+  mostly `--ignore`/`--match`/`--fail` to silence false alarms the new default no longer
+  produces. Only 3 or 4 changed cadence.
+- A restart cost 2 tool calls. The new watcher starts at the end of the file, so the lines
+  written between stop and re-arm went unread: median gap 9 s (up to 105 s), about 660 lines
+  in total.
+- The heartbeat backoff and the cadence estimate restarted too, about 14 extra heartbeats.
+
+So restarts are how instances already change flags, and they are cheap except for the lost
+state. The fix keeps the restart and drops the loss. A watcher leaves its offset, counters,
+cadence estimate, heartbeat interval and clock in a per-file state file. A re-arm on the same
+file and the same job (the fd-holder pids must overlap) within 10 min continues from there.
+Guards, each forcing a fresh start:
+- the previous watcher is still running (a zombie counts as gone);
+- the inode changed, or the file is shorter than the saved offset;
+- the job is different;
+- `--fresh` was passed.
+
+The state is saved at most every 2 s, and a TaskStop'd watcher is SIGKILLed, so the next one
+may re-read up to 2 s of lines. That is a duplicate at worst, never a gap.

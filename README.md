@@ -44,6 +44,18 @@ than `>>`): then from the top, so a failure printed in the seconds before the Mo
 armed is not skipped. `--from-start` forces the top. Heartbeats count lines since bgwatch
 attached and say how much the file held before.
 
+**Changing flags mid-job.** Stop the Monitor and arm a new one with the new flags. A new
+bgwatch on the same file and the same job, within 10 min of the previous one stopping,
+continues where that one left off:
+- it reads the lines written in between, where a fresh watcher would skip them;
+- it keeps the line and fail counts, the cadence estimate the stall threshold is built on, and
+  the heartbeat backoff and clock.
+
+The banner says so ("continuing the previous watcher of this job …"). `--fresh` starts over.
+A relaunched job (new pids), a replaced or truncated file, or a previous watcher that is still
+running all start fresh anyway. The state is a small JSON per watched file under
+`<tmp>/bgwatch-<uid>/`, rewritten at most every 2 s.
+
 **Progress that isn't in the log.** `--probe CMD` runs a shell command on every status
 line (`[hb]`, `[STALL]`, `--once`) and appends its output, so each wake carries a number
 instead of `alive · 0 lines` — a batch's pending count from the provider's API, a queue

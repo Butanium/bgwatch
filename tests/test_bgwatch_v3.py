@@ -273,3 +273,47 @@ def test_replay_fail_regex_reports_one_sided_lines(tmp_path):
     assert {(r["side"], r["line"]) for r in rows} == {
         ("baseline-only", "the main error is the verb"), ("baseline-only", "all good, 0 errors"), ("candidate-only", "KeyError: 'x'")}
     assert "files where only the baseline fires (1)" in p.stdout and "b.log" in p.stdout
+
+
+def _watch_for(log, seconds, *args):
+    """Run bgwatch on `log` for `seconds`, then SIGKILL it (what a TaskStop does to a Monitor)."""
+    p = subprocess.Popen([sys.executable, str(BGWATCH), str(log), *args], stdout=subprocess.PIPE, text=True)
+    time.sleep(seconds)
+    p.kill()
+    return p.stdout.read().splitlines()
+
+
+def test_restart_continues_the_previous_watcher(tmp_path, monkeypatch):
+    """Stop + re-arm (to change flags) loses nothing: lines written while no watcher ran are read,
+    and the heartbeat clock continues. `>>` so the young-job read-from-top rule doesn't mask it."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    log = tmp_path / "job.log"
+    lines = [f"step {i}" for i in range(10)] + ["KeyError: 'written while nobody watched'"] + [f"step {i}" for i in range(10, 40)]
+    proc = writer(log, lines, dt=0.3, hold=2, mode="a")
+    env_args = ["--every", "60", "--stall", "0", "--check-every", "0.3"]
+    first = _watch_for(log, 1.5, *env_args)
+    assert first and "continuing" not in first[0], first
+    time.sleep(2.2)  # the KeyError lands at ~3 s, between the two watchers
+    p = subprocess.run([sys.executable, str(BGWATCH), str(log), *env_args, "--fail-also", "never-matches"],
+                       capture_output=True, text=True, timeout=40, env={**os.environ, "TMPDIR": str(tmp_path)})
+    proc.wait()
+    out = p.stdout.splitlines()
+    assert "continuing the previous watcher" in out[0], out
+    assert any(l.startswith("[fail]") and "written while nobody watched" in l for l in out), out
+    ex = [l for l in out if l.startswith("[EXIT")]
+    assert ex and int(re.search(r"\[EXIT (\d+):(\d+)\]", ex[0]).group(2)) >= 10, ex  # clock continued from the first watcher
+
+
+def test_restart_of_a_different_job_or_with_fresh_starts_over(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    log = tmp_path / "job.log"
+    proc = writer(log, [f"a {i}" for i in range(10)], dt=0.2, hold=0.5, mode="a")
+    _watch_for(log, 1.0, "--every", "60", "--stall", "0", "--check-every", "0.3")
+    proc.wait()
+    proc = writer(log, [f"b {i}" for i in range(10)], dt=0.2, hold=0.5, mode="a")  # a relaunch: new pids
+    time.sleep(0.5)
+    out = _watch_for(log, 1.0, "--every", "60", "--stall", "0", "--check-every", "0.3")
+    assert out and "continuing" not in out[0], out
+    out = _watch_for(log, 0.8, "--every", "60", "--stall", "0", "--check-every", "0.3", "--fresh")
+    proc.wait()
+    assert out and "continuing" not in out[0], out

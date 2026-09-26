@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
+import json
 import os
 import tempfile
 import re
@@ -117,6 +119,7 @@ def fd_flags(pid: int, fd: str) -> int | None:
 
 
 O_APPEND = 0o2000
+HANDOFF_S = 600  # a re-arm on the same file and job within this long continues the previous watcher
 # files a job writes that are data, not its log (for the "the job is writing X" pointer)
 NOT_A_LOG = (".eval", ".db", ".sqlite", ".sqlite3", "-journal", "-wal", ".pt", ".bin", ".safetensors",
              ".parquet", ".arrow", ".npy", ".npz", ".zip", ".tar", ".gz", ".png", ".jpg", ".mp4", ".lock")
@@ -154,6 +157,9 @@ class Job:
 
     def describe(self) -> str:
         return self.kind
+
+    def key(self) -> list:
+        return []
 
 
 class FdHolderJob(Job):
@@ -193,6 +199,9 @@ class FdHolderJob(Job):
 
     def describe(self) -> str:
         return f"pid {min(self.pids)}" if self.pids else "no process holds the file"
+
+    def key(self) -> list:
+        return sorted(self.pids)
 
     def age(self) -> float | None:
         ages = [a for a in (process_age(p) for p in self.pids) if a is not None]
@@ -259,6 +268,9 @@ class PidJob(Job):
     def describe(self) -> str:
         return f"pid {self.pid}"
 
+    def key(self) -> list:
+        return [self.pid]
+
 
 def ancestors(pid: int) -> set[int]:
     out = set()
@@ -318,6 +330,29 @@ class SlurmJob(Job):
     def describe(self) -> str:
         return f"slurm {self.jobid} {self.state}"
 
+    def key(self) -> list:
+        return [self.jobid]
+
+
+# ------------------------------------------------------------------- handoff
+
+
+def state_path_for(path: Path) -> Path:
+    """Where a watcher leaves its position for the next one on the same file."""
+    uid = os.getuid() if hasattr(os, "getuid") else ""
+    key = hashlib.sha1(str(path.expanduser().resolve()).encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"bgwatch-{uid}" / f"{key}.json"
+
+
+def pid_running(pid: int) -> bool:
+    """Linux (/proc); elsewhere a still-running watcher reads as gone. A zombie (killed, not yet
+    reaped by the harness) counts as gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
 
 # ------------------------------------------------------------------- watcher
 
@@ -344,6 +379,8 @@ class Watcher:
         self.max_gap = 0.0  # longest silence between two lines seen so far
         self.hb_interval = a.every_min if a.every == "auto" else float(a.every)
         self.bytes_before = 0  # file content already there when we attached at its end
+        self.state_file = state_path_for(self.path) if self.path else None
+        self._last_save = 0.0
         self.pointed_elsewhere = False
 
     def _make_job(self) -> Job:
@@ -542,13 +579,22 @@ class Watcher:
             )
             return 4
         detect = "off (--no-exit: following the file until TaskStop)" if not self.job.seen else self.job.describe() + fallback
+        handoff = self.take_handoff(f) if f else None
+        resumed = ""
+        if handoff:
+            unread = max(0, os.fstat(f.fileno()).st_size - handoff["offset"])
+            resumed = (f" · continuing the previous watcher of this job (stopped {hms(time.time() - handoff['updated'])} ago): "
+                       f"{handoff['lines']} lines already seen, {unread / 1000:.1f} kB written since, read now")
         emit(
             f"[bgwatch] watching {self.path or self.job.describe()} · job-end detection: {detect}"
-            f" · {self.describe_defaults()}"
+            f" · {self.describe_defaults()}{resumed}"
         )
-        if f and not (a.from_start or self._fresh_output()):
+        if handoff:
+            self._resume(f, handoff)
+        elif f and not (a.from_start or self._fresh_output()):
             f.seek(0, os.SEEK_END)
             self.bytes_before = f.tell()
+        self.save_state(f, force=True)
         next_hb = time.monotonic() + self.next_hb_interval()
         next_job_check = time.monotonic() + a.check_every
         job_alive = alive
@@ -556,6 +602,8 @@ class Watcher:
             progressed = False
             if f:
                 progressed = self._drain(f)
+                if progressed:
+                    self.save_state(f)
                 if not self.path.exists():
                     emit(f"[EXIT {hms(self.elapsed)}] {self.path} disappeared — stopping")
                     return 3
@@ -577,8 +625,59 @@ class Watcher:
             if now >= next_hb:
                 emit(self.status("hb", job_alive if self.job.seen else None))
                 next_hb = now + self.next_hb_interval()
+                self.save_state(f, force=True)
             if not progressed:
                 time.sleep(a.poll)
+
+    def save_state(self, f, force: bool = False) -> None:
+        """Leave this watcher's position and cadence for a re-arm on the same file (a restart to
+        change flags). Throttled; a SIGKILLed watcher loses at most the last couple of seconds."""
+        now = time.monotonic()
+        if not self.state_file or f is None or (not force and now - self._last_save < 2):
+            return
+        self._last_save = now
+        try:
+            d = {"pid": os.getpid(), "updated": time.time(), "inode": os.fstat(f.fileno()).st_ino, "offset": f.tell(),
+                 "job": self.job.key(), "lines": self.lines, "fail_count": self.fail_count, "max_gap": self.max_gap,
+                 "t0_wall": time.time() - self.elapsed, "last_write_wall": time.time() - (now - self.last_write),
+                 "hb_interval": self.hb_interval, "last_line": self.last_line, "tail": self.tail}
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_file.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(d))
+            os.replace(tmp, self.state_file)
+        except (OSError, ValueError):
+            pass  # a lost handoff only means the next watcher starts fresh
+
+    def take_handoff(self, f) -> dict | None:
+        """The previous watcher's state, if it watched this same file and this same job, stopped
+        less than HANDOFF_S ago, and isn't still running. A relaunched job (new pids), a replaced
+        or truncated file, or --fresh all start fresh."""
+        if self.a.fresh or not self.state_file:
+            return None
+        try:
+            d = json.loads(self.state_file.read_text())
+            size, inode = os.fstat(f.fileno()).st_size, os.fstat(f.fileno()).st_ino
+        except (OSError, ValueError):
+            return None
+        if not 0 <= time.time() - d.get("updated", 0) <= HANDOFF_S:
+            return None
+        if d.get("pid") != os.getpid() and pid_running(d.get("pid", 0)):
+            return None
+        if d.get("inode") != inode or d.get("offset", 0) > size:
+            return None
+        mine, theirs = set(map(str, self.job.key())), set(map(str, d.get("job") or []))
+        if not mine or not (mine & theirs):
+            return None
+        return d
+
+    def _resume(self, f, d: dict) -> None:
+        now, wall = time.monotonic(), time.time()
+        f.seek(d["offset"])
+        self.lines, self.fail_count, self.max_gap = d["lines"], d["fail_count"], d["max_gap"]
+        self.t0 = now - (wall - d["t0_wall"])
+        self.last_write = now - (wall - d["last_write_wall"])
+        self.hb_interval = d["hb_interval"] if self.a.every == "auto" else self.hb_interval
+        self.last_line, self.tail = d.get("last_line", ""), d.get("tail", [])
 
     def _fresh_output(self) -> bool:
         """The job started moments ago and the file holds only its output (a harness task file,
@@ -673,6 +772,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--check-every", type=float, default=5, metavar="S", help="job liveness poll interval (default 5)")
     p.add_argument("--poll", type=float, default=POLL_S, metavar="S", help="file poll interval (default 1); also the granularity of the auto stall cadence estimate")
     p.add_argument("--no-exit", action="store_true", help="keep following the file after the job ends")
+    p.add_argument("--fresh", action="store_true", help="don't continue a previous watcher of this file and job (default: a re-arm within 10 min picks up its read position, cadence and heartbeat backoff)")
     p.add_argument("--once", action="store_true", help="print one status line and exit (a poll that isn't a cat)")
     p.add_argument("--print-defaults", action="store_true", help="print the default failure / ignore regexes and exit")
     return p
