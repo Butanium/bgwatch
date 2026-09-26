@@ -263,3 +263,16 @@ that ran past 2 min, 5 would get the deferred hint, a mean 149 s after they star
 Gap: hooks only run on tool calls, so a deferred hint can't reach an idle model. The job's
 completion notification still does. What the replay can't show is whether the one-line form
 keeps adoption as high as the full hint did; a whowill arm would measure that.
+
+## 2026-09-25 (night) — two more failure classes, from a wider replay
+
+Replaying the new default over every task file on disk (1,175 job outputs, not only the long
+jobs) turned up real failure lines it missed. There were two shapes:
+- a program's own lower-case report: `runpod_session: setup failed on pod …`,
+  `mats_render: render failed on job …`;
+- an error payload: `{'error': 'dedup call failed'}`, `{"error": "The encrypted content …"}`.
+
+Both are now alternatives (`^[\w.-]+: .*\bfailed\b`, `['"]error['"]\s*:\s*['"]`). Replay
+against the previous default (`replay/fail_regex.py --baseline main`): +5 real lines, 0 false,
+0 lines lost. `Terminated` was tried and dropped: 1 real hit (a command killed by `timeout`,
+which the exit code already reports) against 3 intentional `pkill`s of helper processes.

@@ -51,6 +51,7 @@ def test_default_fail_is_log_shaped(tmp_path):
         "[exited with code 144]",
         '{"status": "ok", "error": null}',
         "- Failed requests or errors",
+        "run.sh: line 3: 4242 Terminated              modalwatch stream app",  # an intentional kill, mostly
     ]
     real = [
         "ERROR  run failed: command exited (1)",
@@ -68,7 +69,6 @@ def test_default_fail_is_log_shaped(tmp_path):
         "[ELIFECYCLE] Command failed with exit code 1.",
         "runpod_session: setup failed on pod 2c49 (it is still running)",
         "dedup: {'error': 'dedup call failed'}",
-        "run.sh: line 3: 4242 Terminated              python serve.py",
     ]
     log = tmp_path / "job.log"
     proc = writer(log, benign + real, dt=0.02, hold=0.5)
