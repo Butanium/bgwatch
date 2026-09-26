@@ -4,8 +4,11 @@ the exact Monitor call that watches it, so arming a watcher is a yes/no instead 
 four decisions (pattern, buffering, timeout, exit condition).
 
 Fires only when `tool_response.backgroundTaskId` is present (explicit
-run_in_background, or auto-backgrounded at the sync timeout). Subagents are skipped:
-they receive neither completion notifications nor Monitor events.
+run_in_background, or auto-backgrounded at the sync timeout). In-process teammates are
+skipped: while idle they are not re-woken by their own notifications, so a watcher's events
+would wait in the lead's queue. Subagents do get the hint: on 2.1.280 they have Monitor and a
+Monitor event re-invokes an idle subagent (probed 2026-09-25: the `[bgwatch]` banner and a
+`[match]` each woke a haiku subagent that had ended its turn).
 
 Which file to watch: if the command redirects stdout to a file (`> job.log 2>&1`), that
 file — the first whowill A/B (2026-09-14) showed every instance re-pointing the hint at
@@ -23,6 +26,7 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 import time
 
 def output_file(session_id: str, task_id: str, cwd: str) -> str:
@@ -206,11 +210,28 @@ def render(t: dict, full: bool, deferred_min: float | None = None) -> str:
     )
 
 
+def is_in_process_teammate(data: dict) -> bool:
+    """A bare `agent_id` (no `@team`) is a subagent or an in-process teammate. They differ only in
+    the CLI's sidecar `subagents/agent-<id>.meta.json`, whose taskKind is "in_process_teammate"."""
+    agent_id = data.get("agent_id") or ""
+    tp = data.get("transcript_path")
+    if not agent_id or "@" in agent_id or not tp:
+        return False
+    p, name = Path(tp), f"agent-{agent_id}.meta.json"
+    for meta in (p.parent / name, p.parent / p.stem / "subagents" / name,
+                 p.parent / str(data.get("session_id")) / "subagents" / name):
+        try:
+            return json.loads(meta.read_text()).get("taskKind") == "in_process_teammate"
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def main() -> None:
     data = json.load(sys.stdin)
     if data.get("tool_name") != "Bash":
         return
-    if data.get("agent_id") and "@" not in data["agent_id"]:  # subagent: can't wait on a Monitor
+    if is_in_process_teammate(data):  # idle in-process teammates aren't re-woken by their notifications
         return
     session = data.get("session_id", "")
     cwd = data.get("cwd", "")

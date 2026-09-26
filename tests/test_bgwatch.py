@@ -212,10 +212,18 @@ def test_hook_hint(tmp_path):
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert 'Monitor(command="bgwatch babc123"' in ctx and "persistent=true" in ctx
     assert 'description="Train the \'big\' model"' in ctx
-    # no hint for sleep timers, subagents, or non-background calls
+    # a subagent gets the hint: Monitor events re-invoke it (probed 2026-09-25)
+    d = json.loads(json.dumps(payload)); d["agent_id"] = "deadbeef"
+    p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(d), capture_output=True, text=True, env=hook_env(tmp_path))
+    assert "bgwatch babc123" in p.stdout
+    # an in-process teammate (sidecar taskKind) doesn't: idle, it isn't re-woken by its own events
+    transcript = tmp_path / "sess-1.jsonl"; transcript.write_text("")
+    side = tmp_path / "sess-1" / "subagents"; side.mkdir(parents=True)
+    (side / "agent-aworker-1234.meta.json").write_text(json.dumps({"taskKind": "in_process_teammate"}))
+    # no hint for sleep timers, in-process teammates, or non-background calls
     for mutate in (
         lambda d: d["tool_input"].update(command="sleep 60 && echo tick"),
-        lambda d: d.update(agent_id="deadbeef"),
+        lambda d: d.update(agent_id="aworker-1234", transcript_path=str(transcript)),
         lambda d: d["tool_response"].pop("backgroundTaskId"),
     ):
         d = json.loads(json.dumps(payload)); mutate(d)
