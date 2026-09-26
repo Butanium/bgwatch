@@ -317,3 +317,67 @@ def test_restart_of_a_different_job_or_with_fresh_starts_over(tmp_path, monkeypa
     out = _watch_for(log, 0.8, "--every", "60", "--stall", "0", "--check-every", "0.3", "--fresh")
     proc.wait()
     assert out and "continuing" not in out[0], out
+
+
+def test_ctl_changes_a_running_watcher_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    log = tmp_path / "job.log"
+    lines = []
+    for i in range(12):
+        lines += [f"step {i}", f"ERROR: known noise {i}"]
+    proc = writer(log, lines, dt=0.25, hold=0.5)
+    w = subprocess.Popen([sys.executable, str(BGWATCH), str(log), "--from-start", "--every", "60", "--stall", "0",
+                          "--check-every", "0.3", "--poll", "0.2"], stdout=subprocess.PIPE, text=True)
+    time.sleep(2.0)
+    c = subprocess.run([sys.executable, str(BGWATCH), "ctl", str(log), "--ignore", "known noise", "--every", "900"],
+                       capture_output=True, text=True, timeout=30)
+    assert c.returncode == 0 and "applied" in c.stdout, (c.stdout, c.stderr)
+    out = w.communicate(timeout=30)[0].splitlines()
+    proc.wait()
+    i = next(n for n, l in enumerate(out) if l.startswith("[ctl"))
+    assert "known noise" in out[i] and "every 15:00" in out[i], out[i]
+    before, after = out[:i], out[i + 1:]
+    assert any("known noise" in l for l in before if l.startswith("[fail"))
+    assert not any("known noise" in l for l in after if l.startswith("[fail")), after
+
+
+def test_ctl_accepts_the_monitors_task_id_and_reports_no_watcher(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    log = tmp_path / "job.log"
+    proc = writer(log, [f"step {i}" for i in range(20)], dt=0.2, hold=0.5)
+    w = subprocess.Popen([sys.executable, str(BGWATCH), str(log), "--every", "60", "--stall", "0", "--check-every", "0.3",
+                          "--poll", "0.2"], stdout=subprocess.PIPE, text=True)
+    time.sleep(1.0)
+    monitor_out = tmp_path / "bmonitor1.output"  # what the harness writes for the Monitor task itself
+    monitor_out.write_text(f"[bgwatch] watching {log} · job-end detection: pid 1\n")
+    c = subprocess.run([sys.executable, str(BGWATCH), "ctl", str(monitor_out), "--match", "step 1[0-9]"],
+                       capture_output=True, text=True, timeout=30)
+    assert c.returncode == 0 and str(log) in c.stdout, c.stdout
+    w.communicate(timeout=30); proc.wait()
+    c = subprocess.run([sys.executable, str(BGWATCH), "ctl", str(tmp_path / "nothing.log"), "--every", "60"],
+                       capture_output=True, text=True, timeout=30)
+    assert c.returncode == 1 and "no running bgwatch" in c.stdout
+
+
+def test_repeated_identical_failures_are_counted_not_repeated(tmp_path):
+    log = tmp_path / "job.log"
+    lines = [f"Sample error (id: p{i}, epoch: 1): RuntimeError('0 valid draws after {i} rounds')" for i in range(7)]
+    proc = writer(log, lines + ["KeyError: 'other'"], dt=0.05, hold=0.5)
+    rc, out = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.3"])
+    proc.wait()
+    f = [l for l in out if l.startswith("[fail")]
+    assert sum(l.startswith("[fail] Sample error") for l in f) == 2, f
+    assert any(l.startswith("[fail ×5] Sample error") for l in f), f
+    assert "[fail] KeyError: 'other'" in f
+
+
+def test_silence_before_the_first_line_counts_as_cadence(tmp_path):
+    """A block-buffered job: silent, then a burst, then silent again. The burst must not collapse
+    the stall threshold to its floor."""
+    log = tmp_path / "job.log"
+    code = ("import sys, time\ntime.sleep(3)\nsys.stdout.write(''.join(f'line {i}\\n' for i in range(30))); sys.stdout.flush()\n"
+            "time.sleep(2.5)\nprint('done', flush=True)\n")
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=open(log, "w"), stderr=subprocess.STDOUT)
+    rc, out = run_watch([str(log), "--every", "60", "--stall", "auto", "--stall-min", "1", "--check-every", "0.3", "--poll", "0.1"])
+    proc.wait()
+    assert not any(l.startswith("[STALL") for l in out), out

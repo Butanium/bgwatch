@@ -120,6 +120,8 @@ def fd_flags(pid: int, fd: str) -> int | None:
 
 O_APPEND = 0o2000
 HANDOFF_S = 600  # a re-arm on the same file and job within this long continues the previous watcher
+FAIL_SHOWN = 2  # an identical failure line (numbers masked) is shown this many times, then counted
+HELD_FLUSH_S = 600  # counted repeats are reported at the next status line, or after this long
 # files a job writes that are data, not its log (for the "the job is writing X" pointer)
 NOT_A_LOG = (".eval", ".db", ".sqlite", ".sqlite3", "-journal", "-wal", ".pt", ".bin", ".safetensors",
              ".parquet", ".arrow", ".npy", ".npz", ".zip", ".tar", ".gz", ".png", ".jpg", ".mp4", ".lock")
@@ -344,6 +346,16 @@ def state_path_for(path: Path) -> Path:
     return Path(tempfile.gettempdir()) / f"bgwatch-{uid}" / f"{key}.json"
 
 
+def fail_key(text: str) -> str:
+    """A failure line with every token that holds a digit masked: 'Sample error (id: p1, epoch: 1)'
+    and '(id: hr8, epoch: 1)' are the same failure."""
+    return re.sub(r"\S*\d\S*", "#", " ".join(text.split()))[:300]
+
+
+def ctl_path_for(path: Path) -> Path:
+    return state_path_for(path).with_suffix(".ctl.json")
+
+
 def pid_running(pid: int) -> bool:
     """Linux (/proc); elsewhere a still-running watcher reads as gone. A zombie (killed, not yet
     reaped by the harness) counts as gone."""
@@ -381,6 +393,13 @@ class Watcher:
         self.bytes_before = 0  # file content already there when we attached at its end
         self.state_file = state_path_for(self.path) if self.path else None
         self._last_save = 0.0
+        self.ctl_file = ctl_path_for(self.path) if self.path else None
+        self.ctl_seq = 0
+        self._ctl_mtime = None
+        self.fail_src, self.ignore_src, self.match_src = a.fail, a.ignore, a.match
+        self.fail_seen: dict[str, int] = {}
+        self.fail_held: dict[str, list] = {}  # key -> [count since last report, last text]
+        self._held_since = time.monotonic()
         self.pointed_elsewhere = False
 
     def _make_job(self) -> Job:
@@ -402,8 +421,9 @@ class Watcher:
     def _remember(self, line: str) -> None:
         now = time.monotonic()
         self.silence_start = self.last_write
-        if self.lines:
-            self.max_gap = max(self.max_gap, now - self.last_write)
+        # The silence before the first line counts too: a block-buffered job that prints nothing
+        # for 40 min and then 88 lines at once has a 40-min cadence, not a 0-s one.
+        self.max_gap = max(self.max_gap, now - self.last_write)
         self.lines += 1
         self.last_write = now
         if line.strip():
@@ -429,8 +449,23 @@ class Watcher:
         return True
 
     def _emit_match(self, tag: str, text: str) -> None:
+        if tag == "fail":
+            k = fail_key(text)
+            self.fail_seen[k] = self.fail_seen.get(k, 0) + 1
+            if self.fail_seen[k] > FAIL_SHOWN:
+                held = self.fail_held.setdefault(k, [0, text])
+                held[0] += 1
+                held[1] = text
+                return
         if self._rate_ok():
             emit(f"[{tag}] {clip(text)}")
+
+    def flush_held(self) -> None:
+        """Report failures that repeated after being shown FAIL_SHOWN times: one line each."""
+        for count, text in self.fail_held.values():
+            emit(f"[fail ×{count}] {clip(text)} (the same failure again, numbers aside; last one shown)")
+        self.fail_held.clear()
+        self._held_since = time.monotonic()
 
     def handle(self, line: str) -> None:
         line = ANSI_RE.sub("", line)
@@ -618,16 +653,81 @@ class Watcher:
                     if not a.no_exit:
                         return 0
                     self.job = Job()  # keep watching the file, stop asking
+            if self.poll_ctl():
+                next_hb = now + self.next_hb_interval()
+                self.save_state(f, force=True)
+            if self.fail_held and now - self._held_since >= HELD_FLUSH_S:
+                self.flush_held()
             thr = self.stall_threshold
             if thr and not self.stalled and now - self.last_write >= thr and (job_alive or job_alive is None):
                 self.stalled = True
+                self.flush_held()
                 emit(self.status("STALL", job_alive, note=f"no output for {hms(now - self.last_write)}"))
             if now >= next_hb:
+                self.flush_held()
                 emit(self.status("hb", job_alive if self.job.seen else None))
                 next_hb = now + self.next_hb_interval()
                 self.save_state(f, force=True)
             if not progressed:
                 time.sleep(a.poll)
+
+    def poll_ctl(self) -> bool:
+        """Apply a `bgwatch ctl` request if one arrived. True when the heartbeat schedule changed."""
+        if not self.ctl_file:
+            return False
+        try:
+            mtime = self.ctl_file.stat().st_mtime_ns
+        except OSError:
+            return False
+        if mtime == self._ctl_mtime:
+            return False
+        self._ctl_mtime = mtime
+        try:
+            req = json.loads(self.ctl_file.read_text())
+        except (OSError, ValueError):
+            return False
+        if req.get("seq", 0) <= self.ctl_seq:
+            return False
+        self.ctl_seq = req["seq"]
+        return self.apply_ctl(req.get("changes") or {})
+
+    def apply_ctl(self, ch: dict) -> bool:
+        a, said, resched = self.a, [], False
+        if "fail" in ch:
+            self.fail_src = ch["fail"] or None
+            said.append(f"--fail {ch['fail']!r}" if ch["fail"] else "failure patterns off")
+        if ch.get("fail_also"):
+            self.fail_src = f"(?:{self.fail_src})|(?:{ch['fail_also']})" if self.fail_src else ch["fail_also"]
+            said.append(f"--fail-also {ch['fail_also']!r}")
+        if ch.get("ignore"):
+            self.ignore_src = f"(?:{self.ignore_src})|(?:{ch['ignore']})" if self.ignore_src else ch["ignore"]
+            said.append(f"now also ignoring {ch['ignore']!r}")
+        if "match" in ch:
+            self.match_src = ch["match"] or None
+            said.append(f"--match {ch['match']!r}" if ch["match"] else "--match off")
+        self.fail_re = re.compile(self.fail_src) if self.fail_src else None
+        self.ignore_re = re.compile(self.ignore_src) if self.ignore_src else None
+        self.match_re = re.compile(self.match_src) if self.match_src else None
+        if self.ignore_re:  # held repeats of what is now declared noise are dropped, not reported later
+            self.fail_held = {k: v for k, v in self.fail_held.items() if not self.ignore_re.search(v[1])}
+        if "every" in ch:
+            a.every = ch["every"]
+            self.hb_interval = a.every_min if a.every == "auto" else float(a.every)
+            resched = True
+        if "every_max" in ch:
+            a.every_max = float(ch["every_max"])
+            self.hb_interval = min(self.hb_interval, a.every_max) if self.hb_interval > 0 else self.hb_interval
+            resched = True
+        if "stall" in ch:
+            a.stall = ch["stall"]
+            self.stalled = False
+        if "probe" in ch:
+            a.probe = ch["probe"] or None
+            said.append(f"--probe {ch['probe']!r}" if ch["probe"] else "probe off")
+        if resched or "stall" in ch:
+            said.append(self.describe_defaults().split(" · probe")[0])
+        emit(f"[ctl {hms(self.elapsed)}] now: " + " · ".join(said) + " (read position, counts and backoff kept)")
+        return resched
 
     def save_state(self, f, force: bool = False) -> None:
         """Leave this watcher's position and cadence for a re-arm on the same file (a restart to
@@ -640,7 +740,8 @@ class Watcher:
             d = {"pid": os.getpid(), "updated": time.time(), "inode": os.fstat(f.fileno()).st_ino, "offset": f.tell(),
                  "job": self.job.key(), "lines": self.lines, "fail_count": self.fail_count, "max_gap": self.max_gap,
                  "t0_wall": time.time() - self.elapsed, "last_write_wall": time.time() - (now - self.last_write),
-                 "hb_interval": self.hb_interval, "last_line": self.last_line, "tail": self.tail}
+                 "hb_interval": self.hb_interval, "last_line": self.last_line, "tail": self.tail,
+                 "ctl_seq": self.ctl_seq, "argv": sys.argv[1:]}
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_file.with_suffix(f".{os.getpid()}.tmp")
             tmp.write_text(json.dumps(d))
@@ -717,6 +818,7 @@ class Watcher:
             self.handle(line.rstrip("\n"))
 
     def _emit_exit(self) -> None:
+        self.flush_held()
         head = f"[EXIT {hms(self.elapsed)}] job ended ({self.job.describe()})"
         parts = [head]
         if self.path:
@@ -744,7 +846,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  bgwatch batch.log --probe 'python batch_status.py'   # each wake carries the API-side count\n"
             "  bgwatch slurm-44297.out --slurm 44297\n"
             "  bgwatch server.log --pgrep 'vllm serve' --fail 'CUDA|Killed'\n"
-            "  bgwatch --once train.log                             # one status line, then exit"
+            "  bgwatch --once train.log                             # one status line, then exit\n"
+            "  bgwatch ctl train.log --ignore 'Sample error'        # change a running watcher in place (see bgwatch ctl -h)"
         ),
     )
     p.add_argument("file", nargs="?", help="log / task output file to follow, or a bare harness task id (resolved under the tmp task dirs)")
@@ -778,7 +881,102 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def watched_path(target: str) -> Path | None:
+    """The file a target names: a watched file, a job's task id, or a Monitor's own task id (its
+    output starts with bgwatch's `[bgwatch] watching <file>` banner)."""
+    path = Path(resolve_target(target)).expanduser()
+    if state_path_for(path).exists():
+        return path
+    try:
+        with open(path, errors="replace") as f:
+            head = f.readline()
+    except OSError:
+        return None
+    m = re.match(r"\[bgwatch\] watching (\S+)", head)
+    return Path(m.group(1)) if m else None
+
+
+def ctl_main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="bgwatch ctl",
+        description="Change the settings of running bgwatch watchers in place: read position, counts, "
+                    "cadence estimate and heartbeat backoff are kept. The watcher confirms with one [ctl] line.")
+    p.add_argument("targets", nargs="+", metavar="TARGET", help="watched file, the job's task id, or the Monitor's task id (several allowed)")
+    p.add_argument("--fail", metavar="RE", help="replace the failure regex ('' turns failure patterns off)")
+    p.add_argument("--fail-also", metavar="RE", help="extend the failure regex")
+    p.add_argument("--ignore", metavar="RE", help="also ignore lines matching RE (adds to what is ignored already)")
+    p.add_argument("--match", metavar="RE", help="replace the --match regex ('' turns it off)")
+    p.add_argument("--every", metavar="S|auto", help="heartbeat interval (0 = off)")
+    p.add_argument("--every-max", type=float, metavar="S", help="heartbeat backoff cap")
+    p.add_argument("--stall", metavar="S|auto", help="stall threshold (0 = off)")
+    p.add_argument("--probe", metavar="CMD", help="replace the probe command ('' turns it off)")
+    p.add_argument("--wait", type=float, default=5, metavar="S", help="seconds to wait for the watcher to confirm (default 5)")
+    a = p.parse_args(argv)
+    changes = {}
+    for name in ("fail", "fail_also", "ignore", "match"):
+        v = getattr(a, name)
+        if v is not None:
+            if v:
+                try:
+                    re.compile(v)
+                except re.error as e:
+                    p.error(f"--{name.replace('_', '-')}: bad regex: {e}")
+            changes[name] = v
+    for name in ("every", "stall"):
+        v = getattr(a, name)
+        if v is not None:
+            if v != "auto":
+                try:
+                    float(v)
+                except ValueError:
+                    p.error(f"--{name}: expected seconds or 'auto', got {v!r}")
+            changes[name] = v
+    if a.every_max is not None:
+        changes["every_max"] = a.every_max
+    if a.probe is not None:
+        changes["probe"] = a.probe
+    if not changes:
+        p.error("nothing to change")
+    rc = 0
+    for t in a.targets:
+        path = watched_path(t)
+        state = None
+        if path:
+            try:
+                state = json.loads(state_path_for(path).read_text())
+            except (OSError, ValueError):
+                state = None
+        if not state or not pid_running(state.get("pid", 0)):
+            print(f"bgwatch ctl: {t}: no running bgwatch watches it (arm one with Monitor)")
+            rc = 1
+            continue
+        cf = ctl_path_for(path)
+        try:
+            seq = json.loads(cf.read_text()).get("seq", 0) + 1
+        except (OSError, ValueError):
+            seq = state.get("ctl_seq", 0) + 1
+        tmp = cf.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"seq": seq, "changes": changes, "written": time.time()}))
+        os.replace(tmp, cf)
+        deadline = time.monotonic() + a.wait
+        applied = False
+        while time.monotonic() < deadline:
+            try:
+                if json.loads(state_path_for(path).read_text()).get("ctl_seq", 0) >= seq:
+                    applied = True
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        verdict = "applied" if applied else "sent; the watcher applies it at its next poll"
+        print(f"bgwatch ctl: {path} (watcher pid {state['pid']}): {verdict}")
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["ctl"]:
+        return ctl_main(argv[1:])
     a = build_parser().parse_args(argv)
     if a.print_defaults:
         print(f"--fail   {DEFAULT_FAIL}")

@@ -303,3 +303,36 @@ Guards, each forcing a fresh start:
 
 The state is saved at most every 2 s, and a TaskStop'd watcher is SIGKILLed, so the next one
 may re-read up to 2 s of lines. That is a duplicate at worst, never a gap.
+
+## 2026-09-25 (night, later) — `bgwatch ctl`, after a counterfactual reversed the archive verdict
+
+The archive said restarts are rare and cheap, so no live control was needed; see the entry
+above. A counterfactual replay said otherwise for patterns. The setup:
+- `whowill replay`: the original model (fable-5-1), the original date, a shared cache;
+- 3 moments × (control, ctl offered) × N=2, plus 2 interviews per moment;
+- $26 through replay, about $44 including the earlier CLI pilot;
+- notes in ~/claude-playgrounds/archive-sweep-09-25/bgwatch-eval/live-params/NOTES.md.
+
+At the two pattern-noise moments, control instances changed nothing in 4 of 4 samples and
+took the wakes. With `ctl` offered, 4 of 4 used it on the spot, one across six watchers in one
+call. The interviews named the friction: rebuilding the whole flag set to change one field
+("a typo there silently degrades coverage"), and two calls per watcher. At the batch-job
+stall moment nobody wanted it. What was missing there was a probe at arm time and a cadence
+fix. The archive can only count the restarts that happened, not the noise that was tolerated
+instead.
+
+Design:
+- `ctl` resolves each target (a file, the job's task id, or the Monitor's task id via the
+  banner line in its output) to the watcher's per-file state, checks the watcher is alive,
+  validates regexes, and writes `<state>.ctl.json` with a sequence number.
+- The watcher stats that file on every poll, applies the changes, confirms with one
+  `[ctl] now: …` line, and records `ctl_seq` in its state, which `ctl` waits for.
+- `--ignore` and `--fail-also` extend; `--fail`, `--match` and `--probe` replace.
+- Held repeats that match a newly ignored pattern are dropped.
+
+Two companion changes backed by the same evidence:
+- `[fail ×N]`: an identical failure, tokens with digits masked, is shown twice, then counted
+  and reported once per status line. That alone would have made the 1f9d9903 moment quiet.
+- The silence before the first line now counts toward the cadence estimate, so a
+  block-buffered job's 88-line burst after 43 silent minutes no longer drops the stall
+  threshold to its floor (94318b1d).

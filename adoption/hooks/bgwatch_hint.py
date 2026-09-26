@@ -203,7 +203,8 @@ def render(t: dict, full: bool, deferred_min: float | None = None) -> str:
         f"bgwatch wakes you for failure lines, a heartbeat that backs off from 1 to 10 min, silence longer than "
         f"the job's own output cadence, and the job's exit (detected because the job holds that file open — "
         f"no --pid/--pgrep needed when the job writes the watched file{alt}); then it exits itself. "
-        f"Add --match RE for a progress marker, --ignore RE / --fail-also RE to tune patterns (`bgwatch --help`). "
+        f"Add --match RE for a progress marker, --ignore RE / --fail-also RE to tune patterns (`bgwatch --help`); "
+        f"if it turns out noisy later, fix it in place with `bgwatch ctl {watch} --ignore RE` rather than re-arming. "
         f"Not needed for a job that ends in seconds (the completion notification covers it), nor for a server or "
         f"tunnel, which isn't meant to end. Later launches in this session get a one-line hint."
         + cap_note + toolsearch_note()

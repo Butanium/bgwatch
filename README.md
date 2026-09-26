@@ -15,7 +15,7 @@ is a Monitor notification, so it is deliberately sparse:
 | `[fail] …` | a line looks like a failure report (a Traceback, `KeyError: …`, `ERROR`, `FAILED`, `error: …`, `2 failed`, `Killed`, OOM, …). A Python traceback is folded into one line: `Traceback → KeyError: 'labels'` |
 | `[match] …` | a line matches your `--match` (progress / success marker) |
 | `[hb 0:10:00] alive · 1234 lines · idle 0:07 · last: …` | heartbeat; by default the interval backs off 1 → 2 → 4 → 8 → 10 min (`--every S` fixes it, `--every 0` turns it off, `--every-min/--every-max` bound the backoff). While the watched file stays empty it also names any other file the job has open for writing — the usual cause is a task-id watch on a command that redirects to its own log |
-| `[STALL no output for 31:00 …]` | silence longer than the job's own cadence: by default 5× the longest gap seen so far, clamped to 3–30 min (`--stall S` fixes it, `0` disables; `--stall-min/--stall-max` bound auto); `[resumed]` when it writes again |
+| `[STALL no output for 31:00 …]` | silence longer than the job's own cadence: by default 5× the longest gap seen so far (the silence before the first line included, so a block-buffered burst doesn't collapse it), clamped to 3–30 min (`--stall S` fixes it, `0` disables; `--stall-min/--stall-max` bound auto); `[resumed]` when it writes again |
 | `[EXIT 1:23:45] job ended (pid 123) · 5678 lines · 1 fail line seen` + the last `--tail` lines | the job ended. bgwatch exits here, so `persistent: true` never leaks |
 
 **Job end without a PID.** A background task's process holds its output file open on
@@ -44,17 +44,33 @@ than `>>`): then from the top, so a failure printed in the seconds before the Mo
 armed is not skipped. `--from-start` forces the top. Heartbeats count lines since bgwatch
 attached and say how much the file held before.
 
-**Changing flags mid-job.** Stop the Monitor and arm a new one with the new flags. A new
-bgwatch on the same file and the same job, within 10 min of the previous one stopping,
-continues where that one left off:
-- it reads the lines written in between, where a fresh watcher would skip them;
-- it keeps the line and fail counts, the cadence estimate the stall threshold is built on, and
-  the heartbeat backoff and clock.
+**Changing settings mid-job: `bgwatch ctl`.** When a watcher turns out noisy or blind,
+change it in place rather than stopping and re-arming it:
 
-The banner says so ("continuing the previous watcher of this job …"). `--fresh` starts over.
-A relaunched job (new pids), a replaced or truncated file, or a previous watcher that is still
-running all start fresh anyway. The state is a small JSON per watched file under
-`<tmp>/bgwatch-<uid>/`, rewritten at most every 2 s.
+```
+bgwatch ctl train.log --ignore 'Sample error|0 valid draws'   # quiet a known, expected failure
+bgwatch ctl bq7abc123 --fail 'Traceback|Exception'            # the job's or the Monitor's task id works too
+bgwatch ctl run_a.log run_b.log run_c.log --every 900 --stall 0   # several watchers in one call
+```
+
+The watcher applies the change at its next poll and says so in one `[ctl]` line. It keeps its
+read position, line and fail counts, cadence estimate and heartbeat backoff.
+- `--ignore` and `--fail-also` add to what the watcher already has.
+- `--fail`, `--match` and `--probe` replace it (`''` turns one off).
+- `--every`, `--every-max` and `--stall` take effect on the next heartbeat.
+
+Stopping and re-arming also works. A new bgwatch on the same file and the same job, within
+10 min of the previous one stopping, continues where that one left off: it reads the lines
+written in between, and keeps the counts, cadence estimate, heartbeat backoff and clock.
+`--fresh` starts over, and so do a relaunched job (new pids), a replaced or truncated file,
+and a previous watcher that is still running.
+
+The state is a small JSON per watched file under `<tmp>/bgwatch-<uid>/`. `ctl` finds the
+running watcher through it.
+
+**Repeated failures are counted, not repeated.** A failure line identical to one already shown
+twice (tokens with digits masked, so `id: p1` and `id: hr8` match) is held. It is reported once
+as `[fail ×N] …` at the next status line or `[EXIT]`, or after 10 min.
 
 **Progress that isn't in the log.** `--probe CMD` runs a shell command on every status
 line (`[hb]`, `[STALL]`, `--once`) and appends its output, so each wake carries a number

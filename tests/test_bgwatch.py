@@ -188,7 +188,8 @@ def test_pid_mode(tmp_path):
 
 def test_rate_limit(tmp_path):
     log = tmp_path / "job.log"
-    log.write_text("".join(f"Error: {i}\n" for i in range(30)))
+    # distinct failures (digits are masked when repeats are collapsed, so vary the letters)
+    log.write_text("".join(f"Error: {'abcdefghijklmnopqrstuvwxyz'[i % 26]}{'xy'[i // 26]}\n" for i in range(30)))
     proc = subprocess.Popen(["sleep", "1"], stdout=open(log, "a"))  # a short-lived holder
     rc, lines = run_watch([str(log), "--from-start", "--every", "60", "--stall", "0", "--check-every", "0.3", "--max-rate", "5"])
     proc.wait()
