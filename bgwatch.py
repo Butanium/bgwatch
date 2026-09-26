@@ -46,7 +46,9 @@ DEFAULT_FAIL = (
     r"|\b[1-9]\d* (failed|errors?)\b(?!:?\s*(none|0)\b)" # non-zero failure counts, not "0 failed"
     r"|\bSample error\b"                                # inspect_ai per-sample errors
     r"|(?i:\bfailed with\b)"                            # "Runner failed with exception", "Command failed with exit code 1"
-    r"|\bKilled\b|SIGKILL|SIGSEGV|SIGABRT"
+    r"|^[\w.-]+: .*\bfailed\b"                         # a program's own report: "runpod_session: setup failed on pod …"
+    r"|['\"]error['\"]\s*:\s*['\"]"                     # an error payload: {'error': 'dedup call failed'}, not "error": null
+    r"|\b(Killed|Terminated)\b|SIGKILL|SIGSEGV|SIGABRT"
     r"|(?i:out of memory|\boom\b|segmentation fault|core dumped|cuda error|\btimed out\b)"
     r"|(?i:\b(loss|grad_?norm)\w*\s*[=:]\s*nan\b|\bnan (loss|detected|encountered)\b)"
     r"|(?i:command not found|no such file or directory|permission denied)"
