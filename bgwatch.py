@@ -16,6 +16,12 @@ Job end is detected without a PID: a background task's process holds its output
 file open on fd 1/2, so bgwatch scans /proc/*/fd for the file. `--pid`, `--pgrep`
 and `--slurm` cover jobs whose output file isn't held open by the job itself.
 
+When there is no growing file at all (a cloud CLI that dumps and exits, a batch or
+queue status you have to ask for), `--cmd CMD` makes a command the source: it is
+rerun every --cmd-every seconds and the lines that changed since the previous run
+are the event stream (every changed line wakes you unless --match narrows it);
+`--until CMD` ends the watch when that command exits 0.
+
 Every stdout line is a notification, so the output is deliberately sparse.
 """
 from __future__ import annotations
@@ -30,6 +36,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from stat import S_ISREG as stat_is_reg
 
@@ -354,6 +361,81 @@ def fail_key(text: str) -> str:
 
 def ctl_path_for(path: Path) -> Path:
     return state_path_for(path).with_suffix(".ctl.json")
+
+
+def changed_lines(prev: list[str], cur: list[str]) -> list[str]:
+    """Lines of `cur` not accounted for by `prev`, counted as a multiset, in order: a rolling log
+    window yields its new tail, a status dump the lines that changed. A line identical to one
+    still in the previous output is not new, even if the program printed it again."""
+    left = Counter(prev)
+    out = []
+    for line in cur:
+        if left[line] > 0:
+            left[line] -= 1
+        else:
+            out.append(line)
+    return out
+
+
+def start_cmd_poller(a: argparse.Namespace) -> Path:
+    """--cmd: a child process reruns the command and writes what changed to a file it holds open,
+    so everything built for files (fd-holder job end, stall, heartbeats, ctl) applies unchanged.
+    The child exits when --until holds or when this watcher goes away."""
+    uid = os.getuid() if hasattr(os, "getuid") else ""
+    key = hashlib.sha1(a.cmd.encode()).hexdigest()[:12]
+    path = Path(tempfile.gettempdir()) / f"bgwatch-{uid}" / f"cmd-{key}-{os.getpid()}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    args = [sys.executable, os.path.abspath(__file__), "_cmdpoll", "--parent", str(os.getpid()),
+            "--every", str(a.cmd_every), "--cmd", a.cmd]
+    if a.until:
+        args += ["--until", a.until]
+    if a.from_start:
+        args.append("--baseline")
+    with open(path, "w") as out:
+        subprocess.Popen(args, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    return path
+
+
+def cmd_poller_main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="bgwatch _cmdpoll")
+    p.add_argument("--cmd", required=True)
+    p.add_argument("--until")
+    p.add_argument("--every", type=float, required=True)
+    p.add_argument("--parent", type=int, required=True)
+    p.add_argument("--baseline", action="store_true")
+    a = p.parse_args(argv)
+    timeout = max(60.0, 2 * a.every)
+
+    def run(cmd: str) -> tuple[int | None, list[str]]:
+        try:
+            r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               stdin=subprocess.DEVNULL, text=True, errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, []
+        return r.returncode, r.stdout.splitlines()
+
+    prev: list[str] | None = None
+    while os.getppid() == a.parent:
+        rc, lines = run(a.cmd)
+        if rc is None:
+            print(f"[bgwatch --cmd] the command timed out after {timeout:.0f}s", flush=True)
+        elif rc != 0:
+            # prev is kept, so the next good run is diffed against the last good one, not the error text
+            print(f"[bgwatch --cmd] the command exited with code {rc}: {lines[-1] if lines else '(no output)'}", flush=True)
+        else:
+            if prev is None and not a.baseline:
+                print(f"[bgwatch --cmd] baseline: {len(lines)} lines; printing what changes", flush=True)
+            else:
+                for line in lines if prev is None else changed_lines(prev, lines):
+                    print(line, flush=True)
+            prev = lines
+        if a.until and run(a.until)[0] == 0:
+            print(f"[bgwatch --cmd] --until holds: {a.until}", flush=True)
+            return 0
+        deadline = time.monotonic() + a.every
+        while time.monotonic() < deadline and os.getppid() == a.parent:
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    return 0
 
 
 def pid_running(pid: int) -> bool:
@@ -844,6 +926,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  bgwatch train.log --match 'step \\d+00 ' --every 900   # progress every 100 steps, fixed 15-min heartbeat\n"
             "  bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'\n"
             "  bgwatch batch.log --probe 'python batch_status.py'   # each wake carries the API-side count\n"
+            "  bgwatch --cmd 'modal app logs my-app' --match 'Started|Loaded' --cmd-every 45   # a dump-and-exit log CLI\n"
+            "  bgwatch --cmd 'python batch_status.py' --until 'python batch_status.py | grep -q ended'   # no file at all\n"
             "  bgwatch slurm-44297.out --slurm 44297\n"
             "  bgwatch server.log --pgrep 'vllm serve' --fail 'CUDA|Killed'\n"
             "  bgwatch --once train.log                             # one status line, then exit\n"
@@ -865,6 +949,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-default-ignore", action="store_true", help="drop the built-in ignore list (keeps --ignore)")
     p.add_argument("--probe", metavar="CMD", help="shell command run on every status line; its output is appended to the line (for progress that lives outside the log — an API-side batch, a queue depth)")
     p.add_argument("--probe-timeout", type=float, default=45, metavar="S", help="kill a --probe that takes longer than this (default 45)")
+    p.add_argument("--cmd", metavar="CMD", help="no file: rerun CMD every --cmd-every seconds and treat the lines that changed since the previous run as the log (every changed line is a [match] unless --match is given). The first run is the baseline, not printed unless --from-start. A failing run is a [fail] line")
+    p.add_argument("--cmd-every", type=float, default=60, metavar="S", help="--cmd rerun interval (default 60)")
+    p.add_argument("--until", metavar="CMD", help="with --cmd: end the watch ([EXIT]) once CMD exits 0, checked after each run")
     p.add_argument("--pid", type=int, help="the job is this pid")
     p.add_argument("--pgrep", metavar="PATTERN", help="the job is `pgrep -f PATTERN` — with a file, only used if nothing holds the file after --grace")
     p.add_argument("--slurm", metavar="JOBID", help="the job is this slurm job (squeue/sacct)")
@@ -977,7 +1064,22 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["ctl"]:
         return ctl_main(argv[1:])
+    if argv[:1] == ["_cmdpoll"]:
+        return cmd_poller_main(argv[1:])
     a = build_parser().parse_args(argv)
+    if a.until and not a.cmd:
+        build_parser().error("--until needs --cmd")
+    if a.cmd:
+        if a.file or a.pid or a.pgrep or a.slurm or a.once:
+            build_parser().error("--cmd is the source: no file, --pid/--pgrep/--slurm or --once with it")
+        if a.match:
+            try:
+                re.compile(a.match)
+            except re.error as e:
+                build_parser().error(f"--match: bad regex: {e}")
+        a.file = str(start_cmd_poller(a))
+        a.from_start, a.fresh = True, True
+        a.match = a.match or "."
     if a.print_defaults:
         print(f"--fail   {DEFAULT_FAIL}")
         print(f"--ignore {DEFAULT_IGNORE}")

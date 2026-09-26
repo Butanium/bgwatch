@@ -79,6 +79,19 @@ depth, `nvidia-smi` utilisation. It blocks the poll loop for up to `--probe-time
 (default 45 s); a probe that fails or times out says so on the line and never stops the
 watcher.
 
+**No file at all.** When the job's state never lands in a growing file (a cloud CLI that
+dumps its logs and exits, like `modal app logs`; a batch or queue status you have to ask
+for), don't watch the launch log: its writer ends when the *CLI* ends, not the job.
+`--cmd CMD` makes a command the source instead. bgwatch reruns it every `--cmd-every`
+seconds (default 60) and feeds the lines that changed since the previous run into the
+usual machinery. The first run is the baseline and is not replayed unless `--from-start`.
+Every changed line is a `[match]` unless `--match` narrows it; a run that exits non-zero or
+times out is a `[fail]` line, and the next good run is diffed against the last good one.
+`--until CMD` ends the watch with `[EXIT]` once CMD exits 0, checked after each run. Without
+it the watch runs until TaskStop. "Changed" is counted as a multiset, so a rolling log window
+yields its new tail and a status dump yields the lines that differ. A line identical to one
+still in the previous output does not count as new.
+
 **Volume.** `--max-rate N` (default 20/min) caps `[fail]`/`[match]` lines; the excess is
 counted and reported once a minute. Each notification costs ~700 chars of context
 (the harness prepends a fixed preamble); the backoff keeps a 4-hour job at ~25 heartbeats.
@@ -91,6 +104,8 @@ bgwatch bgt3ng9gt                                      # harness background task
 bgwatch train.log --match 'step \d+00 ' --every 900    # progress every 100 steps + 15-min heartbeat
 bgwatch train.log --ignore 'error_rate=' --fail-also 'loss=nan|diverged'
 bgwatch batch.log --probe 'python batch_status.py'     # every wake carries the API-side pending count
+bgwatch --cmd 'modal app logs my-app' --match 'Started|Loaded' --cmd-every 45   # a dump-and-exit log CLI
+bgwatch --cmd 'python batch_status.py' --until 'python batch_status.py | grep -q ended'   # no file at all
 bgwatch slurm-44297.out --slurm 44297                  # slurm: squeue/sacct decide "ended"
 bgwatch server.log --pgrep 'vllm serve' --fail 'CUDA|Killed'
 bgwatch --once train.log

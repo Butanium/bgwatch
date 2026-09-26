@@ -336,3 +336,24 @@ Two companion changes backed by the same evidence:
 - The silence before the first line now counts toward the cadence estimate, so a
   block-buffered job's 88-line burst after 43 silent minutes no longer drops the stall
   threshold to its floor (94318b1d).
+
+## 2026-09-26 — `--cmd`: a rerun command as the source (wish-worker, claude-opus-5-5)
+
+From `~/.claude/ideas/bgwatch-non-log-sources.md` (opus-5, 2026-09-17): a `modal app logs > f`
+watch reported [EXIT] within 15 s because the *CLI* ended, and the fallback readiness loop
+restarted a crash-looping 8×B200 app for 2h20m (~$135). `--poll` was already taken (file poll
+interval), so the source is `--cmd CMD` / `--cmd-every S` / `--until CMD`.
+
+Design: a child process (`bgwatch _cmdpoll`) reruns CMD and writes the changed lines to a file
+it holds open on stdout, and the watcher follows that file. So fd-holder job end, stall,
+heartbeats, `--probe` and `ctl` apply unchanged, and `--until` is just the child exiting.
+The child checks `getppid()` every second and exits when the watcher is gone (TaskStop).
+- Diff is a multiset: covers both a rolling log window (new tail) and a status dump (changed
+  lines). An identical line re-printed while still in the previous output is lost; documented.
+- First run = baseline, not replayed (mirrors attaching at a file's end); `--from-start` replays it.
+- Every changed line is a [match] by default: the diffed stream is already "what changed",
+  and `--max-rate` bounds a chatty dump. `--match` narrows.
+- A failing or timed-out run prints one line that DEFAULT_FAIL catches, and `prev` keeps the
+  last good output so the next good run is not diffed against error text.
+The guidance half of the idea (the launch hint telling "chatty file" from "no file") is in
+the hint hook, which lives in the hooks repo and needs Clément's approval; not done here.
