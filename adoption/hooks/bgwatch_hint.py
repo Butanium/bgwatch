@@ -13,6 +13,9 @@ the job's own log when the hint named the harness task file. Otherwise the harne
 output file, which isn't in the hook payload: it is
 <tmp>/claude-<uid>/<cwd slug>/<session_id>/tasks/<task_id>.output, located by glob so a
 slug-rule change can't silently break the hint (falls back to the computed path).
+
+Linux-only: `held_open` and `already_watched` read /proc. Elsewhere they answer False, so an
+auto-backgrounded command never gets its deferred hint; explicit launches are unaffected.
 """
 import glob
 import json

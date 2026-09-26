@@ -80,13 +80,38 @@ git clone https://github.com/Butanium/bgwatch ~/.claude/tools/bgwatch
 ln -s ../../.claude/tools/bgwatch/bgwatch.py ~/.local/bin/bgwatch
 ```
 
-Python 3.10+, Linux (`/proc`), no dependencies. The `adoption/` directory holds what makes
+Python 3.10+, no dependencies. Linux for the job-end detection; see Platforms below. The `adoption/` directory holds what makes
 a Claude Code config reach for it: a PostToolUse hook that prints the ready-made
 `Monitor(command="bgwatch …")` call after a background launch — with the explanation the
 first time in a session and as one line after that, and for a command the sync timeout
 moved to the background only once it has run 2 minutes (the same hook lives in
 [claude-code-hooks](https://github.com/Butanium/claude-code-hooks)), the settings.json
 fragment that registers it, and a CLAUDE.md paragraph. MIT.
+
+## Platforms
+
+Everything that asks the OS about processes reads `/proc`, so it only works on Linux:
+
+| part | Linux-only because | elsewhere (macOS, Windows) |
+|---|---|---|
+| job end by file holder (the default) | scans `/proc/*/fd` for the file | no holder is ever found, so bgwatch exits 4 after `--grace` ("nothing to watch") |
+| `--pid N` | reads `/proc/N/stat` | the pid is never seen, so no `[EXIT]`: it follows the file until TaskStop |
+| `--pgrep` | `pgrep`, and `/proc/*/stat` to skip bgwatch's own ancestors | `pgrep` exists on macOS but the ancestor filter doesn't; absent on Windows |
+| young-job read-from-top, "N new lines (file had …)" | process start time from `/proc`, fd flags from `/proc/*/fdinfo` | reading starts at the end, as before |
+| wrong-file pointer | the job's process tree and open fds from `/proc` | never printed |
+| bare task id → file | `<tmp>/claude-<uid>/…/tasks/<id>.output`, the Linux harness layout | pass the file path instead |
+
+What works everywhere: following a file, `[fail]` / `[match]`, heartbeats, `[STALL]`, `--probe`,
+`--once`. On macOS or Windows run it with `--no-exit` and stop the Monitor with TaskStop when
+the job's completion notification arrives. That is the watcher without job-end detection.
+
+The launch hint hook (`adoption/hooks/bgwatch_hint.py`) also reads `/proc`, to check whether
+an auto-backgrounded command is still running and whether a bgwatch already watches it.
+Elsewhere those checks answer "no", so auto-backgrounded commands never get a hint. Hints for
+explicitly backgrounded commands are unaffected.
+
+A port would replace these with `psutil`, which covers open files, process trees and start
+times on all three systems. That is a dependency, and nobody has needed it yet.
 
 ## Why it exists
 
