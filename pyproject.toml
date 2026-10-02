@@ -1,0 +1,15 @@
+[project]
+name = "bgwatch"
+version = "0.1.0"
+description = "The Monitor command for anything long-running"
+requires-python = ">=3.9"
+
+[project.scripts]
+bgwatch = "bgwatch:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["bgwatch"]
