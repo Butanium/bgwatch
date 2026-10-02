@@ -133,28 +133,35 @@ fragment that registers it, and a CLAUDE.md paragraph. MIT.
 
 ## Platforms
 
-Everything that asks the OS about processes reads `/proc`, so it only works on Linux:
+Linux reads `/proc`; native Windows Python asks Win32 the same questions (ctypes, no extra
+dependency). macOS has neither, so the job-end parts don't work there:
 
-| part | Linux-only because | elsewhere (macOS, Windows) |
-|---|---|---|
-| job end by file holder (the default) | scans `/proc/*/fd` for the file | no holder is ever found, so bgwatch exits 4 after `--grace` ("nothing to watch") |
-| `--pid N` | reads `/proc/N/stat` | the pid is never seen, so no `[EXIT]`: it follows the file until TaskStop |
-| `--pgrep` | `pgrep`, and `/proc/*/stat` to skip bgwatch's own ancestors | `pgrep` exists on macOS but the ancestor filter doesn't; absent on Windows |
-| young-job read-from-top, "N new lines (file had …)" | process start time from `/proc`, fd flags from `/proc/*/fdinfo` | reading starts at the end, as before |
-| wrong-file pointer | the job's process tree and open fds from `/proc` | never printed |
-| bare task id → file | `<tmp>/claude-<uid>/…/tasks/<id>.output`, the Linux harness layout | pass the file path instead |
+| part | Linux | Windows | macOS |
+|---|---|---|---|
+| job end by file holder (the default) | `/proc/*/fd` | Restart Manager (`RmGetList`): the processes with the file open | no holder is ever found: bgwatch exits 4 after `--grace` |
+| `--pid N` | `/proc/N/stat` | `OpenProcess` + exit code; a Git Bash `$!` (an MSYS pid) is mapped through MSYS's `/proc/N/winpid` | never seen: no `[EXIT]` |
+| `--pgrep` | `pgrep`, minus bgwatch's own ancestors | Toolhelp process snapshot + each command line (`NtQueryInformationProcess`) | no ancestor filter |
+| young-job read-from-top | start time + fd flags (`O_APPEND`) | start time only: task files are read from the top, other files from the end | from the end |
+| wrong-file pointer | the job's process tree and open fds | never printed (no per-process open-file list) | never printed |
+| bare task id → file | `<tmp>/claude-<uid>/…/tasks/<id>.output` | `%TEMP%\claude\…	asks\<id>.output` | pass the file path |
+
+On Windows `--probe`, `--cmd` and `--until` run in Git's bash (found from `git`, never WSL's
+`System32ash.exe`), since Monitor commands are written for the harness's bash, and a file
+argument given as a Git Bash path (`/tmp/x.log`, `/c/…`) is mapped with `cygpath`. A job is
+told apart by pid *and* start time there, because Windows reuses pids within seconds.
 
 What works everywhere: following a file, `[fail]` / `[match]`, heartbeats, `[STALL]`, `--probe`,
-`--once`. On macOS or Windows run it with `--no-exit` and stop the Monitor with TaskStop when
-the job's completion notification arrives. That is the watcher without job-end detection.
+`--once`. On macOS run it with `--no-exit` and stop the Monitor with TaskStop when the job's
+completion notification arrives.
 
-The launch hint hook (`adoption/hooks/bgwatch_hint.py`) also reads `/proc`, to check whether
-an auto-backgrounded command is still running and whether a bgwatch already watches it.
-Elsewhere those checks answer "no", so auto-backgrounded commands never get a hint. Hints for
-explicitly backgrounded commands are unaffected.
+The launch hint hook (`adoption/hooks/bgwatch_hint.py`) reads `/proc` on Linux to check whether
+an auto-backgrounded command is still running and whether a bgwatch already watches it; on
+Windows it loads bgwatch.py from its checkout for the same queries. Elsewhere those checks
+answer "no", so auto-backgrounded commands never get a hint. Hints for explicitly backgrounded
+commands are unaffected.
 
-A port would replace these with `psutil`, which covers open files, process trees and start
-times on all three systems. That is a dependency, and nobody has needed it yet.
+A macOS port could use `psutil` (open files, process trees, start times). That is a
+dependency, and nobody has needed it yet.
 
 ## Why it exists
 

@@ -33,6 +33,7 @@ import json
 import os
 import tempfile
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -90,12 +91,18 @@ def resolve_target(arg: str) -> str:
     <tmp>/claude-<uid>/*/*/tasks/<id>.output, so the Monitor call needs no path."""
     if TASK_ID_RE.match(arg) and not Path(arg).exists():
         uid = os.getuid() if hasattr(os, "getuid") else ""
-        hits = glob.glob(os.path.join(tempfile.gettempdir(), f"claude-{uid}", "*", "*", "tasks", f"{arg}.output"))
+        tmp = tempfile.gettempdir()
+        hits = [h for d in (f"claude-{uid}", "claude")  # the Windows harness drops the -<uid>
+                for h in glob.glob(os.path.join(tmp, d, "*", "*", "tasks", f"{arg}.output"))]
         if len(hits) == 1:
             return hits[0]
         if len(hits) > 1:
             hits.sort(key=os.path.getmtime)
             return hits[-1]
+    if WINDOWS and arg.startswith("/") and not Path(arg).exists() and (cygpath := git_usr_tool("cygpath")):
+        r = subprocess.run([cygpath, "-w", arg], capture_output=True, text=True)  # /c/x, /tmp/x from Git Bash
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
     return arg
 LAST_LINE_MAX = 200
 PROBE_MAX = 160
@@ -104,6 +111,8 @@ POLL_S = 1.0
 
 def process_age(pid: int) -> float | None:
     """Seconds since `pid` started, from /proc/<pid>/stat field 22 and /proc/uptime."""
+    if WINDOWS:
+        return win_process_age(pid)
     try:
         with open(f"/proc/{pid}/stat") as f:
             start_ticks = int(f.read().rsplit(")", 1)[1].split()[19])
@@ -126,6 +135,171 @@ def fd_flags(pid: int, fd: str) -> int | None:
 
 
 O_APPEND = 0o2000
+
+# ---------------------------------------------------------------- Windows process queries
+# Native Windows Python has no /proc. The same questions go to Win32: which processes hold a
+# file (Restart Manager), is a pid running and since when, and the process table with command
+# lines (for --pgrep). Untouched elsewhere.
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import ctypes
+    from ctypes import wintypes as _w
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+    _rm = ctypes.WinDLL("rstrtmgr")
+    _QUERY_LIMITED = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION
+    _STILL_ACTIVE = 259
+    _EPOCH_AS_FILETIME = 116444736000000000
+
+    class _RmUniqueProcess(ctypes.Structure):
+        _fields_ = [("pid", _w.DWORD), ("start_lo", _w.DWORD), ("start_hi", _w.DWORD)]  # FILETIME: 4-byte aligned
+
+    class _RmProcessInfo(ctypes.Structure):
+        _fields_ = [("process", _RmUniqueProcess), ("app_name", _w.WCHAR * 256), ("service", _w.WCHAR * 64),
+                    ("app_type", ctypes.c_int), ("status", _w.ULONG), ("ts_session", _w.DWORD),
+                    ("restartable", _w.BOOL)]
+
+    class _ProcessEntry(ctypes.Structure):
+        _fields_ = [("size", _w.DWORD), ("usage", _w.DWORD), ("pid", _w.DWORD), ("heap", ctypes.c_size_t),
+                    ("module", _w.DWORD), ("threads", _w.DWORD), ("ppid", _w.DWORD), ("prio", _w.LONG),
+                    ("flags", _w.DWORD), ("exe", _w.WCHAR * 260)]
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [("length", _w.USHORT), ("max_length", _w.USHORT), ("buffer", ctypes.c_void_p)]
+
+    _P = ctypes.POINTER
+    for _fn, _res, _args in [
+        (_k32.OpenProcess, _w.HANDLE, [_w.DWORD, _w.BOOL, _w.DWORD]),
+        (_k32.CloseHandle, _w.BOOL, [_w.HANDLE]),
+        (_k32.GetExitCodeProcess, _w.BOOL, [_w.HANDLE, _P(_w.DWORD)]),
+        (_k32.GetProcessTimes, _w.BOOL, [_w.HANDLE] + [_P(ctypes.c_ulonglong)] * 4),
+        (_k32.CreateToolhelp32Snapshot, _w.HANDLE, [_w.DWORD, _w.DWORD]),
+        (_k32.Process32FirstW, _w.BOOL, [_w.HANDLE, _P(_ProcessEntry)]),
+        (_k32.Process32NextW, _w.BOOL, [_w.HANDLE, _P(_ProcessEntry)]),
+        (_ntdll.NtQueryInformationProcess, ctypes.c_long, [_w.HANDLE, ctypes.c_int, ctypes.c_void_p, _w.ULONG, _P(_w.ULONG)]),
+        (_rm.RmStartSession, _w.DWORD, [_P(_w.DWORD), _w.DWORD, ctypes.c_wchar_p]),
+        (_rm.RmRegisterResources, _w.DWORD, [_w.DWORD, _w.UINT, _P(_w.LPCWSTR), _w.UINT, ctypes.c_void_p, _w.UINT, ctypes.c_void_p]),
+        (_rm.RmGetList, _w.DWORD, [_w.DWORD, _P(_w.UINT), _P(_w.UINT), ctypes.c_void_p, _P(_w.DWORD)]),
+        (_rm.RmEndSession, _w.DWORD, [_w.DWORD]),
+    ]:
+        _fn.restype, _fn.argtypes = _res, _args
+
+
+def win_file_holders(path: str) -> dict[int, float]:
+    """pid -> start time (unix seconds) of every process with `path` open."""
+    session, key = _w.DWORD(), ctypes.create_unicode_buffer(64)
+    if _rm.RmStartSession(ctypes.byref(session), 0, key):
+        return {}
+    try:
+        files = (_w.LPCWSTR * 1)(path)
+        if _rm.RmRegisterResources(session, 1, files, 0, None, 0, None):
+            return {}
+        need, n, reason = _w.UINT(), _w.UINT(0), _w.DWORD()
+        arr = None
+        for _ in range(3):  # ERROR_MORE_DATA when holders appear between the two calls
+            rc = _rm.RmGetList(session, ctypes.byref(need), ctypes.byref(n), arr, ctypes.byref(reason))
+            if rc != 234:
+                break
+            arr, n = (_RmProcessInfo * need.value)(), _w.UINT(need.value)
+        if rc or arr is None:
+            return {}
+        procs = [arr[i].process for i in range(n.value)]
+        return {p.pid: ((p.start_hi << 32 | p.start_lo) - _EPOCH_AS_FILETIME) / 1e7 for p in procs}
+    finally:
+        _rm.RmEndSession(session)
+
+
+def win_pid_running(pid: int) -> bool:
+    h = _k32.OpenProcess(_QUERY_LIMITED, False, pid)
+    if not h:
+        return ctypes.get_last_error() == 5  # access denied: it exists, it just isn't ours
+    try:
+        code = _w.DWORD()
+        return bool(_k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == _STILL_ACTIVE
+    finally:
+        _k32.CloseHandle(h)
+
+
+def win_process_age(pid: int) -> float | None:
+    h = _k32.OpenProcess(_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        t = [ctypes.c_ulonglong() for _ in range(4)]
+        if not _k32.GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
+            return None
+        return time.time() - (t[0].value - _EPOCH_AS_FILETIME) / 1e7
+    finally:
+        _k32.CloseHandle(h)
+
+
+def win_cmdline(pid: int) -> str | None:
+    h = _k32.OpenProcess(_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        size = _w.ULONG(1024)
+        for _ in range(3):
+            buf = ctypes.create_string_buffer(size.value)
+            st = _ntdll.NtQueryInformationProcess(h, 60, buf, size, ctypes.byref(size))  # ProcessCommandLineInformation
+            if st & 0xFFFFFFFF != 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH
+                break
+        if st:
+            return None
+        us = _UnicodeString.from_buffer(buf)
+        return ctypes.wstring_at(us.buffer, us.length // 2) if us.buffer else ""
+    finally:
+        _k32.CloseHandle(h)
+
+
+def win_processes() -> dict[int, int]:
+    """pid -> parent pid, from a Toolhelp snapshot."""
+    snap = _k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, _w.HANDLE(-1).value):
+        return {}
+    out = {}
+    try:
+        e = _ProcessEntry()
+        e.size = ctypes.sizeof(e)
+        ok = _k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            out[e.pid] = e.ppid
+            ok = _k32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        _k32.CloseHandle(snap)
+    return out
+
+
+def msys_to_winpid(pid: int) -> int | None:
+    """`$!` in Git Bash is an MSYS pid, not a Windows one; MSYS's own /proc maps it."""
+    try:
+        r = subprocess.run(["cat", f"/proc/{pid}/winpid"], capture_output=True, text=True, timeout=5)
+        return int(r.stdout.strip()) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def git_usr_tool(name: str) -> str | None:
+    """A Git for Windows tool (bash, cygpath) found from git itself: a bare `bash` on a
+    Windows PATH is often WSL's (System32), which can't see Windows paths the same way."""
+    git = shutil.which("git")
+    for root in (Path(git).parents[1], Path(git).parents[2]) if git else ():
+        for sub in ("bin", "usr/bin"):
+            cand = root / sub / f"{name}.exe"
+            if cand.is_file():
+                return str(cand)
+    found = shutil.which(name)
+    return found if found and "system32" not in found.lower() else None
+
+
+def run_shell(cmd: str, **kw) -> subprocess.CompletedProcess:
+    """`cmd` through a POSIX shell. Monitor commands are written in the harness's bash, so
+    on Windows --probe / --cmd / --until go to Git's bash rather than cmd.exe."""
+    bash = git_usr_tool("bash") if WINDOWS else None
+    if bash:
+        return subprocess.run([bash, "-c", cmd], **kw)
+    return subprocess.run(cmd, shell=True, **kw)
 HANDOFF_S = 600  # a re-arm on the same file and job within this long continues the previous watcher
 FAIL_SHOWN = 2  # an identical failure line (numbers masked) is shown this many times, then counted
 HELD_FLUSH_S = 600  # counted repeats are reported at the next status line, or after this long
@@ -180,9 +354,25 @@ class FdHolderJob(Job):
         self.target = str(path.resolve())
         self.me = os.getpid()
         self.pids: set[int] = set()
-        self.appends = False  # some holder opened the file with O_APPEND (`>>`, or the harness)
+        self.starts: dict[int, float] = {}  # Windows: holder start times, since pids are reused fast
+        # some holder opened the file with O_APPEND (`>>`, or the harness); None: can't tell (Windows)
+        self.appends: bool | None = None if WINDOWS else False
 
     def alive(self) -> bool:
+        if WINDOWS:
+            holders = win_file_holders(self.target)
+            holders.pop(self.me, None)
+            pids = set(holders)
+            if pids:
+                self.starts = holders
+        else:
+            pids = self._proc_holders()
+        if pids:
+            self.seen = True
+            self.pids = pids
+        return bool(pids)
+
+    def _proc_holders(self) -> set[int]:
         pids = set()
         for fd_dir in Path("/proc").glob("[0-9]*/fd"):
             pid = int(fd_dir.parent.name)
@@ -201,15 +391,14 @@ class FdHolderJob(Job):
                         continue
             except OSError:  # process vanished or not ours
                 continue
-        if pids:
-            self.seen = True
-            self.pids = pids
-        return bool(pids)
+        return pids
 
     def describe(self) -> str:
         return f"pid {min(self.pids)}" if self.pids else "no process holds the file"
 
     def key(self) -> list:
+        if WINDOWS:
+            return sorted(f"{p}@{self.starts.get(p, 0):.0f}" for p in self.pids)
         return sorted(self.pids)
 
     def age(self) -> float | None:
@@ -219,7 +408,10 @@ class FdHolderJob(Job):
     def other_writes(self, limit: int = 2) -> list[str]:
         """Regular files the job's process tree has open for writing, other than the watched
         one: where the output went when the watched file stays empty (a task-id watch on a
-        command that redirects to its own log)."""
+        command that redirects to its own log). Linux only: Windows has no per-process
+        listing of open files short of walking the system handle table."""
+        if WINDOWS:
+            return []
         children: dict[int, list[int]] = {}
         for stat in Path("/proc").glob("[0-9]*/stat"):
             try:
@@ -263,9 +455,13 @@ class PidJob(Job):
     kind = "pid"
 
     def __init__(self, pid: int):
-        self.pid = pid
+        self.pid = (msys_to_winpid(pid) or pid) if WINDOWS else pid
 
     def alive(self) -> bool:
+        if WINDOWS:
+            running = win_pid_running(self.pid)
+            self.seen |= running
+            return running
         try:
             with open(f"/proc/{self.pid}/stat") as f:
                 state = f.read().rsplit(")", 1)[1].split()[0]
@@ -282,6 +478,11 @@ class PidJob(Job):
 
 
 def ancestors(pid: int) -> set[int]:
+    if WINDOWS:
+        parents, out = win_processes(), set()
+        while (pid := parents.get(pid, 0)) and pid not in out:
+            out.add(pid)
+        return out
     out = set()
     while pid > 1:
         try:
@@ -305,8 +506,12 @@ class PgrepJob(Job):
         self.exclude = {os.getpid()} | ancestors(os.getpid())
 
     def alive(self) -> bool:
-        out = subprocess.run(["pgrep", "-f", self.pattern], capture_output=True, text=True).stdout
-        pids = {int(p) for p in out.split() if p.strip()} - self.exclude
+        if WINDOWS:
+            rx = re.compile(self.pattern)
+            pids = {p for p in win_processes() if p not in self.exclude and rx.search(win_cmdline(p) or "")}
+        else:
+            out = subprocess.run(["pgrep", "-f", self.pattern], capture_output=True, text=True).stdout
+            pids = {int(p) for p in out.split() if p.strip()} - self.exclude
         if pids:
             self.seen = True
         return bool(pids)
@@ -408,14 +613,17 @@ def cmd_poller_main(argv: list[str]) -> int:
 
     def run(cmd: str) -> tuple[int | None, list[str]]:
         try:
-            r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               stdin=subprocess.DEVNULL, text=True, errors="replace", timeout=timeout)
+            r = run_shell(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          stdin=subprocess.DEVNULL, text=True, errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             return None, []
         return r.returncode, r.stdout.splitlines()
 
+    def parent_alive() -> bool:  # Windows never reparents, so getppid() can't tell
+        return pid_running(a.parent) if WINDOWS else os.getppid() == a.parent
+
     prev: list[str] | None = None
-    while os.getppid() == a.parent:
+    while parent_alive():
         rc, lines = run(a.cmd)
         if rc is None:
             print(f"[bgwatch --cmd] the command timed out after {timeout:.0f}s", flush=True)
@@ -433,14 +641,15 @@ def cmd_poller_main(argv: list[str]) -> int:
             print(f"[bgwatch --cmd] --until holds: {a.until}", flush=True)
             return 0
         deadline = time.monotonic() + a.every
-        while time.monotonic() < deadline and os.getppid() == a.parent:
+        while time.monotonic() < deadline and parent_alive():
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
     return 0
 
 
 def pid_running(pid: int) -> bool:
-    """Linux (/proc); elsewhere a still-running watcher reads as gone. A zombie (killed, not yet
-    reaped by the harness) counts as gone."""
+    """A zombie (killed, not yet reaped by the harness) counts as gone."""
+    if WINDOWS:
+        return pid > 0 and win_pid_running(pid)
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
@@ -622,9 +831,7 @@ class Watcher:
         if not self.a.probe:
             return None
         try:
-            p = subprocess.run(
-                self.a.probe, shell=True, capture_output=True, text=True, timeout=self.a.probe_timeout
-            )
+            p = run_shell(self.a.probe, capture_output=True, text=True, timeout=self.a.probe_timeout)
         except subprocess.TimeoutExpired:
             return f"probe timed out after {self.a.probe_timeout:g}s"
         except Exception as e:  # a probe must never take the watcher down with it
@@ -873,7 +1080,7 @@ class Watcher:
         if age is None or age > YOUNG_JOB_S:
             return False
         task_file = self.path.parent.name == "tasks" and self.path.suffix == ".output"
-        return task_file or not job.appends
+        return task_file or job.appends is False
 
     def _open_wait(self):
         deadline = time.monotonic() + self.a.grace

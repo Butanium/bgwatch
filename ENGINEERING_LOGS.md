@@ -357,3 +357,34 @@ The child checks `getppid()` every second and exits when the watcher is gone (Ta
   last good output so the next good run is not diffed against error text.
 The guidance half of the idea (the launch hint telling "chatty file" from "no file") is in
 the hint hook, which lives in the hooks repo and needs Clément's approval; not done here.
+
+## 2026-10-02 — Windows port (claude-opus-5-5, Clément's Windows box)
+
+bgwatch ran on Windows only as a file follower: every job-end path read `/proc`, so a
+default watch exited 4 after `--grace` and the hint's `bgwatch <task-id>` couldn't resolve.
+Native Windows Python now asks Win32 the same questions through ctypes (no dependency):
+- job end by file holder: Restart Manager (`RmGetList` on the file). Probed first on a live
+  task: the holders are the job's own bash/sleep processes, not claude.exe, so "no holder
+  left" means the job ended, as on Linux. `RM_UNIQUE_PROCESS` carries a FILETIME, which is
+  two 4-byte DWORDs; declaring it as one c_ulonglong padded the struct and garbled every
+  field after the first pid (caught by the restart test).
+- job identity is `pid@start` on Windows: pids are reused within seconds there, and a
+  relaunched job sharing a pid with the old one resumed the previous watcher's position.
+- `--pid`: OpenProcess + exit code; a Git Bash `$!` is an MSYS pid (448 for winpid 52736 in
+  the probe), mapped through MSYS's `/proc/N/winpid` with Git's `cat`.
+- `--pgrep`: Toolhelp snapshot + NtQueryInformationProcess(ProcessCommandLineInformation).
+- `--probe` / `--cmd` / `--until` run in Git's bash, located from `git` because a bare `bash`
+  on a Windows PATH is often WSL's (System32). File args given as Git Bash paths go through
+  `cygpath -w`.
+- the `--cmd` poller watched `getppid()` change, which never happens on Windows (no
+  reparenting); it now checks that the parent pid is still running.
+Not ported: the wrong-file pointer (no per-process open-file list short of walking the
+handle table) and O_APPEND detection (so non-task files of a young job are read from the
+end). The two tests for those skip on Windows.
+Test gotcha: in a uv venv on Windows `sys.executable` is a launcher whose child is the real
+interpreter, and killing the launcher leaves the child running; the poller test kills the
+child. The installed `bgwatch.exe` launcher does take its child down (checked), so a
+Monitor stopped by the harness doesn't leak a watcher.
+Result on Windows: 47 passed, 2 skipped (was 23 of the first 28 failing). End-to-end: a
+Monitor on `bgwatch <task-id>` resolved the task file, flagged the FAILED lines, and exited
+on its own with `[EXIT 4:31] job ended`.

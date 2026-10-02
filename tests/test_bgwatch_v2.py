@@ -36,8 +36,10 @@ def test_pgrep_ignores_own_ancestors(tmp_path):
     proc = start_job(log, "--steps", "20", "--dt", "0.3", "--crash-at", "99")  # ~6 s: outlives the first /proc scan
     # watch a file nobody holds, so the fd-holder scan finds nothing and --pgrep is the fallback
     unheld = tmp_path / "unheld.log"; unheld.write_text("x\n")
-    wrapper = f'echo wrapper-mentions fake_job.py >/dev/null; exec {sys.executable} {BGWATCH} {unheld} --pgrep fake_job.py --grace 0.5 --every 60 --stall 0 --check-every 0.3'
-    p = subprocess.run(["bash", "-c", wrapper], capture_output=True, text=True, timeout=30)
+    py, bw, uh = (Path(x).as_posix() for x in (sys.executable, BGWATCH, unheld))  # bash eats backslashes
+    wrapper = f'echo wrapper-mentions fake_job.py >/dev/null; exec {py} {bw} {uh} --pgrep fake_job.py --grace 0.5 --every 60 --stall 0 --check-every 0.3'
+    from bgwatch import WINDOWS, git_usr_tool
+    p = subprocess.run([git_usr_tool("bash") if WINDOWS else "bash", "-c", wrapper], capture_output=True, text=True, timeout=30)
     proc.wait()
     lines = p.stdout.splitlines()
     assert p.returncode == 0, lines
@@ -116,13 +118,14 @@ def test_hint_names_redirect_target(tmp_path):
 def test_bare_task_id_resolves(tmp_path, monkeypatch):
     import os, tempfile
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    tmpenv = {"TMP": str(tmp_path), "TEMP": str(tmp_path)} if os.name == "nt" else {}  # Windows reads TMP/TEMP
     tempfile.tempdir = None
-    uid = os.getuid()
-    d = tmp_path / f"claude-{uid}" / "-some-slug" / "sess-9" / "tasks"; d.mkdir(parents=True)
+    d = tmp_path / ("claude" if os.name == "nt" else f"claude-{os.getuid()}") / "-some-slug" / "sess-9" / "tasks"
+    d.mkdir(parents=True)
     log = d / "bq7abc123.output"
     proc = start_job(log, "--steps", "2", "--dt", "0.2", "--crash-at", "99")
     p = subprocess.run([sys.executable, str(BGWATCH), "bq7abc123", "--from-start", "--every", "60", "--stall", "0",
-                        "--check-every", "0.3"], capture_output=True, text=True, timeout=30, env={**os.environ, "TMPDIR": str(tmp_path)})
+                        "--check-every", "0.3"], capture_output=True, text=True, timeout=30, env={**os.environ, "TMPDIR": str(tmp_path), **tmpenv})
     proc.wait()
     lines = p.stdout.splitlines()
     assert p.returncode == 0 and str(log) in lines[0], lines

@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).parent
 BGWATCH = HERE.parent / "bgwatch.py"
 FAKE_JOB = HERE / "fake_job.py"
@@ -95,6 +97,7 @@ def test_every_zero_turns_heartbeats_off(tmp_path):
     assert not any(l.startswith("[hb") for l in lines), lines
 
 
+@pytest.mark.skipif(os.name == "nt", reason="needs O_APPEND from /proc/*/fdinfo; Windows reads task files from the top only")
 def test_young_job_file_read_from_the_top(tmp_path):
     """The failure is printed before the watcher attaches (instances arm it ~5 s after launch)."""
     log = tmp_path / "job.log"
@@ -117,6 +120,7 @@ def test_appended_log_still_starts_at_the_end(tmp_path):
     assert any("new lines (file had" in l for l in lines if l.startswith("[hb")), lines
 
 
+@pytest.mark.skipif(os.name == "nt", reason="other_writes lists open files from /proc; no Windows equivalent")
 def test_points_at_the_file_the_job_really_writes(tmp_path):
     """A task-id watch on `cmd > own.log`: the watched file stays empty, the heartbeat says where output went."""
     watched, own = tmp_path / "task.output", tmp_path / "own.log"
@@ -157,7 +161,7 @@ def call_hook(tmp_path, command, session="sess-1", task="babc123", background=Tr
         tool_input["run_in_background"] = True
     payload = {"session_id": session, "cwd": str(tmp_path), "tool_name": "Bash", "tool_input": tool_input, "tool_response": resp}
     p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True,
-                       env={**os.environ, "TMPDIR": str(tmp_path)})
+                       env={**os.environ, "TMPDIR": str(tmp_path), **({"TMP": str(tmp_path), "TEMP": str(tmp_path)} if os.name == "nt" else {})})  # Windows reads TMP/TEMP
     assert p.returncode == 0, p.stderr
     return json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"] if p.stdout.strip() else ""
 
@@ -198,7 +202,7 @@ def test_hint_mentions_servers(tmp_path):
 
 
 def state_path(tmp_path, session):
-    return tmp_path / f"claude-{os.getuid()}" / "bgwatch_hint" / f"{session}.json"
+    return tmp_path / ("claude-" if os.name == "nt" else f"claude-{os.getuid()}") / "bgwatch_hint" / f"{session}.json"
 
 
 def test_full_hint_once_per_session_then_one_line(tmp_path):
@@ -250,7 +254,11 @@ def test_no_deferred_hint_when_finished_or_already_watched(tmp_path):
     call_hook(tmp_path, "make build", session="s6", task="bauto0006", background=False, timed_out_ms=60000)
     out = tmp_path / "bauto0006.output"
     holder = subprocess.Popen(["sleep", "20"], stdout=open(out, "w"))
-    watcher = subprocess.Popen(["bash", "-c", "exec -a bgwatch python3 -c 'import time; time.sleep(20)' bauto0006"])
+    if os.name == "nt":  # no exec -a: a stand-in script named bgwatch.py carries the name instead
+        (tmp_path / "bgwatch.py").write_text("import time; time.sleep(20)\n")
+        watcher = subprocess.Popen([sys.executable, str(tmp_path / "bgwatch.py"), "bauto0006"])
+    else:
+        watcher = subprocess.Popen(["bash", "-c", "exec -a bgwatch python3 -c 'import time; time.sleep(20)' bauto0006"])
     try:
         time.sleep(0.3)
         _age_pending(tmp_path, "s6", out)

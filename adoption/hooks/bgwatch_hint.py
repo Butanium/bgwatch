@@ -14,11 +14,14 @@ Which file to watch: if the command redirects stdout to a file (`> job.log 2>&1`
 file — the first whowill A/B (2026-09-14) showed every instance re-pointing the hint at
 the job's own log when the hint named the harness task file. Otherwise the harness task
 output file, which isn't in the hook payload: it is
-<tmp>/claude-<uid>/<cwd slug>/<session_id>/tasks/<task_id>.output, located by glob so a
+<tmp>/claude-<uid>/<cwd slug>/<session_id>/tasks/<task_id>.output (<tmp>/claude/… on
+Windows), located by glob so a
 slug-rule change can't silently break the hint (falls back to the computed path).
 
-Linux-only: `held_open` and `already_watched` read /proc. Elsewhere they answer False, so an
-auto-backgrounded command never gets its deferred hint; explicit launches are unaffected.
+`held_open` and `already_watched` read /proc on Linux. On Windows they borrow bgwatch's
+Win32 queries (Restart Manager, process command lines); where neither is available they
+answer False, so an auto-backgrounded command never gets its deferred hint; explicit
+launches are unaffected.
 """
 import glob
 import json
@@ -31,7 +34,7 @@ import time
 
 def output_file(session_id: str, task_id: str, cwd: str) -> str:
     uid = os.getuid() if hasattr(os, "getuid") else ""
-    base = os.path.join(tempfile.gettempdir(), f"claude-{uid}")
+    base = os.path.join(tempfile.gettempdir(), "claude" if os.name == "nt" else f"claude-{uid}")
     hits = glob.glob(os.path.join(base, "*", session_id, "tasks", f"{task_id}.output"))
     if hits:
         return hits[0]
@@ -90,6 +93,8 @@ def redirect_target(command: str, cwd: str) -> tuple[str | None, str | None]:
     target = os.path.expanduser(target)
     if "$" in target or "`" in target:
         return None, raw
+    if os.name == "nt" and target.startswith("/"):  # a Git Bash path (/tmp/x, /c/x): bgwatch maps it with cygpath
+        return target, raw
     base = cwd
     m = LEADING_CD_RE.match(text)
     if m:
@@ -134,8 +139,29 @@ def save_state(session_id: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
+def _bgwatch_module():
+    """bgwatch's Win32 process queries, from its checkout: ~/.claude/tools/bgwatch next to a
+    deployed hooks dir, or the repo root above adoption/hooks."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "..", "tools", "bgwatch", "bgwatch.py"), os.path.join(here, "..", "..", "bgwatch.py")):
+        if not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("bgwatch", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod if getattr(mod, "WINDOWS", False) else None
+        except (OSError, ImportError, AttributeError, SyntaxError):
+            return None
+    return None
+
+
 def held_open(path: str) -> bool:
     """Some process holds `path` open, i.e. the background task that writes it is still running."""
+    if os.name == "nt":
+        bw = _bgwatch_module()
+        return bool(bw and bw.win_file_holders(os.path.realpath(path)))
     target = os.path.realpath(path)
     for fd_dir in glob.glob("/proc/[0-9]*/fd"):
         try:
@@ -154,6 +180,14 @@ def held_open(path: str) -> bool:
 def already_watched(task_id: str, watch: str) -> bool:
     """A bgwatch process already follows this task, by id or by the file it writes."""
     names = {task_id, os.path.basename(watch)}
+    if os.name == "nt":
+        bw = _bgwatch_module()
+        for pid in bw.win_processes() if bw else ():
+            args = [a.strip('"') for a in (bw.win_cmdline(pid) or "").split()]
+            if any(os.path.basename(a).lower() in ("bgwatch", "bgwatch.exe", "bgwatch.py") for a in args[:2]):
+                if any(os.path.basename(a) in names for a in args[1:]):
+                    return True
+        return False
     for cmdline in glob.glob("/proc/[0-9]*/cmdline"):
         try:
             with open(cmdline, "rb") as f:
@@ -170,8 +204,10 @@ def watch_target(command: str, cwd: str, task_id: str) -> tuple[str, str, str | 
     """(what to pass bgwatch, kind, raw redirect text); kind is task / redirect / unresolved."""
     log, raw = redirect_target(command, cwd)
     if log:
-        rel = os.path.relpath(log, cwd)
-        return (rel if not rel.startswith("..") else log), "redirect", raw
+        rel = log if os.name == "nt" and log.startswith("/") else os.path.relpath(log, cwd)
+        watch = rel if not rel.startswith("..") else log
+        # the Monitor command runs in bash, which eats unquoted backslashes
+        return (watch.replace("\\", "/") if os.name == "nt" else watch), "redirect", raw
     if raw:
         return f"<absolute path of {raw}>", "unresolved", raw
     return task_id, "task", None
