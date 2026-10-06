@@ -82,6 +82,10 @@ DEFAULT_IGNORE = (
     r"|^\[exited with code \d+\]$"
 )
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# The harness appends this to a task's output file once the shell it launched exits. Processes
+# still holding the file after that are orphans (a pipeline's children when the shell was killed),
+# and waiting for them kept a watcher heartbeating "alive" on a finished task.
+HARNESS_EXIT_RE = re.compile(r"^\[exited with code (\d+)\]$")
 TRACEBACK_HEAD = re.compile(r"^Traceback \(most recent call last\)")
 TASK_ID_RE = re.compile(r"^[a-z0-9]{6,12}$")
 
@@ -692,6 +696,7 @@ class Watcher:
         self.fail_held: dict[str, list] = {}  # key -> [count since last report, last text]
         self._held_since = time.monotonic()
         self.pointed_elsewhere = False
+        self.harness_exit: str | None = None  # the code in the harness's "[exited with code N]" trailer
 
     def _make_job(self) -> Job:
         """--pid / --slurm are authoritative. With a file, the fd-holder scan comes first and
@@ -717,6 +722,9 @@ class Watcher:
         self.max_gap = max(self.max_gap, now - self.last_write)
         self.lines += 1
         self.last_write = now
+        trailer = HARNESS_EXIT_RE.match(line.strip())
+        if trailer:
+            self.harness_exit = trailer.group(1)
         if line.strip():
             self.last_line = line
             self.tail.append(line)
@@ -890,6 +898,8 @@ class Watcher:
             if f:  # a status line should say how much the job has written so far
                 for line in f:
                     self._remember(line.rstrip("\n"))
+            if self.job.kind == "fd-holder" and self.harness_exit is not None:
+                alive = False
             emit(self.status("status", alive if self.job.seen else None))
             return 0
         if self.job.kind in ("fd-holder", "pgrep") and not self.job.seen and not a.no_exit:
@@ -935,10 +945,12 @@ class Watcher:
             if now >= next_job_check and self.job.kind != "none":
                 job_alive = self.job.alive()
                 next_job_check = now + a.check_every
-                if self.job.seen and not job_alive:
+                trailer = self.job.kind == "fd-holder" and self.harness_exit is not None
+                orphans = sorted(self.job.pids) if trailer and job_alive else []
+                if self.job.seen and (not job_alive or trailer):
                     if f:
                         self._drain(f)  # last lines written before exit
-                    self._emit_exit()
+                    self._emit_exit(orphans)
                     if not a.no_exit:
                         return 0
                     self.job = Job()  # keep watching the file, stop asking
@@ -1106,9 +1118,14 @@ class Watcher:
             got = True
             self.handle(line.rstrip("\n"))
 
-    def _emit_exit(self) -> None:
+    def _emit_exit(self, orphans: list[int] | None = None) -> None:
         self.flush_held()
-        head = f"[EXIT {hms(self.elapsed)}] job ended ({self.job.describe()})"
+        if orphans:
+            head = (f"[EXIT {hms(self.elapsed)}] job ended (the harness reported exit {self.harness_exit}; "
+                    f"pid{'s' if len(orphans) > 1 else ''} {', '.join(map(str, orphans))} still hold the file, "
+                    "likely orphans of the killed shell)")
+        else:
+            head = f"[EXIT {hms(self.elapsed)}] job ended ({self.job.describe()})"
         parts = [head]
         if self.path:
             parts.append(f"{self.lines} lines")

@@ -388,3 +388,16 @@ Monitor stopped by the harness doesn't leak a watcher.
 Result on Windows: 47 passed, 2 skipped (was 23 of the first 28 failing). End-to-end: a
 Monitor on `bgwatch <task-id>` resolved the task file, flagged the FAILED lines, and exited
 on its own with `[EXIT 4:31] job ended`.
+
+## 2026-10-05 — the harness's exit trailer ends an fd-holder watch (claude-opus-5-5)
+
+A task launched as `cd X && timeout 600 git fetch ... | tail -3; git log ...` was stopped by
+killing its shell. The harness appended `[exited with code 144]` and sent the completion
+notification, but the pipeline's children (`git fetch`, `tail`) lived on as orphans holding
+the output file, so the fd-holder scan kept answering "alive": the watcher heartbeated
+`alive · last: [exited with code 144]` until TaskStop. The trailer is the harness's own
+statement that the shell it launched is gone, so an fd-holder watch now ends on it, and the
+[EXIT] line names the pids still holding the file. `--once` reports such a task as ended.
+`--pid` / `--pgrep` / `--slurm` watches ignore the trailer: there the user named the process.
+Tests: `test_harness_exit_trailer_ends_the_watch_despite_orphans`,
+`test_once_reports_ended_after_the_harness_trailer` (both fail on the previous version).

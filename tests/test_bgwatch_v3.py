@@ -389,3 +389,39 @@ def test_silence_before_the_first_line_counts_as_cadence(tmp_path):
     rc, out = run_watch([str(log), "--every", "60", "--stall", "auto", "--stall-min", "1", "--check-every", "0.3", "--poll", "0.1"])
     proc.wait()
     assert not any(l.startswith("[STALL") for l in out), out
+
+
+def test_harness_exit_trailer_ends_the_watch_despite_orphans(tmp_path):
+    """Killing a background task's shell leaves its pipeline children holding the output file;
+    the harness still appends "[exited with code N]". The watch ends on that trailer instead of
+    heartbeating "alive" until the orphans die, and names them."""
+    import threading
+
+    log = tmp_path / "task.output"
+    orphan = writer(log, ["fetching"], hold=30)
+
+    def harness_writes_trailer():
+        time.sleep(2)
+        with open(log, "a") as f:
+            f.write("[exited with code 144]\n")
+
+    threading.Thread(target=harness_writes_trailer, daemon=True).start()
+    try:
+        rc, lines = run_watch([str(log), "--every", "60", "--stall", "0", "--check-every", "0.3"], timeout=20)
+    finally:
+        orphan.kill()
+    exits = [l for l in lines if l.startswith("[EXIT")]
+    assert rc == 0 and exits, lines
+    assert "the harness reported exit 144" in exits[0] and str(orphan.pid) in exits[0], exits
+    assert not fails(lines), lines
+
+
+def test_once_reports_ended_after_the_harness_trailer(tmp_path):
+    log = tmp_path / "task.output"
+    orphan = writer(log, ["fetching", "[exited with code 0]"], hold=10)
+    time.sleep(1)
+    try:
+        rc, lines = run_watch(["--once", str(log)])
+    finally:
+        orphan.kill()
+    assert rc == 0 and lines and "alive" not in lines[0], lines
