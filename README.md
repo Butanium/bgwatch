@@ -20,7 +20,8 @@ is a Monitor notification, so it is deliberately sparse:
 
 **Job end without a PID.** A background task's process holds its output file open on
 fd 1/2, so bgwatch scans `/proc/*/fd` for the file (verified on the harness's tasks,
-2026-09-14). For jobs that don't hold the file — a slurm job, a server started elsewhere,
+2026-09-14). After that first scan it checks only the holders it found, one `readlink` each,
+and scans again only when none of them has the file any more, before calling the job ended. For jobs that don't hold the file — a slurm job, a server started elsewhere,
 a process that daemonizes — give it `--pid N` or `--slurm JOBID` (authoritative), or `--pgrep PATTERN`, which with a file is only a fallback: the fd-holder scan wins whenever something holds the file, and the pattern is consulted only if nothing does after `--grace`. `--pgrep` ignores bgwatch itself and every ancestor process (the harness runs a Monitor command through a `bash -c` wrapper whose command line contains the pattern).
 If nothing holds the file within `--grace` seconds (and no `--pgrep` fallback matches),
 bgwatch exits with code 4 and says so: a watcher that can never see its job end is the

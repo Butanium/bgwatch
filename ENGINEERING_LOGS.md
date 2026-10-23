@@ -401,3 +401,45 @@ statement that the shell it launched is gone, so an fd-holder watch now ends on 
 `--pid` / `--pgrep` / `--slurm` watches ignore the trailer: there the user named the process.
 Tests: `test_harness_exit_trailer_ends_the_watch_despite_orphans`,
 `test_once_reports_ended_after_the_harness_trailer` (both fail on the previous version).
+
+## 2026-10-23 — job-liveness checks no longer rescan all of /proc every 5 s (claude-opus-5-5)
+
+Each running watcher used 22-42% of a core (5 at once ≈ 1.75 cores on truthful-1). Cause:
+`FdHolderJob.alive()` ran every `--check-every` (5 s) and each call did a full
+`/proc/*/fd` scan, one `readlink` per open fd on the box. truthful-1 had 311k fds open,
+~250k of them held by 152 `mcp-repl` processes with ~6k fds each, so one scan cost ~2.4 s
+of CPU, mostly kernel time, and took 3-10 s of wall time on a loaded box. The cost scales
+with the fds open on the whole box, not with the job, so it went unnoticed while that number
+was small. Rewriting
+the scan with `os.listdir` and string paths only brought it to 1.9 s: the number of
+syscalls was the problem, not Python overhead.
+
+Fix: the full scan records, for each holder, the fd it holds the file on. Later checks
+`readlink` only those (pid, fd) pairs. The full scan runs again only when none of them still
+points at the file, and its answer is what decides "ended", so the semantics are unchanged:
+a holder that opened the file after the watcher attached is found when the original holders
+let go (`test_job_end_waits_for_a_holder_that_opened_the_file_later`). When the harness's
+exit trailer has appeared the check is a full scan, so the orphan pids named in [EXIT] are
+the complete set, as before. Between full scans `self.pids` holds only the known holders still
+holding the file. That matters only for `describe()` (min pid), the handoff key (any shared pid
+is enough) and the root of `other_writes()`'s process tree, and all three stay correct.
+
+`--pgrep` had the same pattern at a smaller cost: one `pgrep -f` every 5 s, ~70 ms of CPU
+each with 1000 processes (1.5% of a core). The verdict is now reused while at least one
+matched pid still has the command line it had when pgrep matched it. When none does (exit, exec, zombie,
+whose cmdline reads empty), pgrep runs again, so the answer is always pgrep's own.
+
+Measured with pidstat over 60 s on an idle watch (a file getting a line every 30 s), before →
+after: file 40.7% → 0.02%, task id 41.2% → 0.07%, `--pgrep` with its children 1.55% →
+0.02%. `--poll` and `--check-every` are unchanged, so [fail] still surfaces within ~1 s of
+the line (0.98 s measured) and [EXIT] within one check plus one full scan (6.4 s measured).
+
+Tests: 53 passed, including the two new ones (the second is
+`test_pgrep_job_ends_when_the_matched_process_execs_into_something_else`). On truthful-1
+as it is now, about 20 of the tests fail with the old code and the new code alike: the
+first full scan still takes several seconds, and those tests assume it takes milliseconds
+(a 1-s fake job is gone before the watcher has found it). They pass in a private pid
+namespace, whose /proc shows only the test's own processes:
+`sudo unshare --pid --fork --mount-proc runuser -u $USER -- env PATH="$PATH" HOME="$HOME" bash -c 'cd ~/.claude/tools/bgwatch && uv run --no-project --with pytest python -m pytest -q tests'`.
+Don't run two copies of the suite at the same time either: the --pgrep tests match each
+other's `fake_job.py` processes.

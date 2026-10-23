@@ -425,3 +425,46 @@ def test_once_reports_ended_after_the_harness_trailer(tmp_path):
     finally:
         orphan.kill()
     assert rc == 0 and lines and "alive" not in lines[0], lines
+
+
+def test_job_end_waits_for_a_holder_that_opened_the_file_later(tmp_path):
+    """Between full /proc scans only the holders found by the last one are checked. When they
+    are all gone the watcher rescans before calling the job ended, so a process that opened the
+    file after the watcher attached keeps the watch alive and is the pid named in [EXIT]."""
+    log = tmp_path / "job.log"
+    first = writer(log, ["from first"], hold=120)
+    watcher = subprocess.Popen([sys.executable, str(BGWATCH), str(log), "--from-start", "--every", "60",
+                                "--stall", "0", "--check-every", "0.3"], stdout=subprocess.PIPE, text=True)
+    second = None
+    try:
+        assert watcher.stdout.readline().startswith("[bgwatch] watching"), "no banner"
+        second = writer(log, ["second started", "second after first"], dt=3, hold=120, mode="a")
+        time.sleep(0.5)
+        first.kill()
+        first.wait()
+        time.sleep(6)
+        assert watcher.poll() is None, "the watch ended while the second holder still had the file"
+        second.kill()
+        out = watcher.communicate(timeout=60)[0].splitlines()
+    finally:
+        for p in (first, second, watcher):
+            if p and p.poll() is None:
+                p.kill()
+    exits = [l for l in out if l.startswith("[EXIT")]
+    assert watcher.returncode == 0 and exits and f"(pid {second.pid})" in exits[0], out
+    assert any("second after first" in l for l in out), out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="exec keeps the pid only on POSIX")
+def test_pgrep_job_ends_when_the_matched_process_execs_into_something_else(tmp_path):
+    """pgrep's verdict is reused while the matched pid keeps its command line; an exec that
+    changes it (same pid, no longer matching) has to end the watch like an exit does."""
+    marker = f"bgwatch-exec-marker-{os.getpid()}"
+    job = subprocess.Popen(["bash", "-c", f": {marker}; sleep 3; exec sleep 60"])
+    try:
+        rc, lines = run_watch(["--pgrep", marker, "--every", "60", "--stall", "0", "--check-every", "0.3"], timeout=40)
+        still_running = job.poll() is None
+    finally:
+        job.kill()
+    exits = [l for l in lines if l.startswith("[EXIT")]
+    assert rc == 0 and exits and still_running, lines

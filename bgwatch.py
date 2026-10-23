@@ -358,11 +358,14 @@ class FdHolderJob(Job):
         self.target = str(path.resolve())
         self.me = os.getpid()
         self.pids: set[int] = set()
+        self.fds: dict[int, str] = {}  # pid -> the fd it held the file on at the last full scan
         self.starts: dict[int, float] = {}  # Windows: holder start times, since pids are reused fast
         # some holder opened the file with O_APPEND (`>>`, or the harness); None: can't tell (Windows)
         self.appends: bool | None = None if WINDOWS else False
 
-    def alive(self) -> bool:
+    def alive(self, full: bool = False) -> bool:
+        """`full` rescans every process even while a known holder still has the file, for an
+        exact holder set (the orphan pids named in [EXIT])."""
         if WINDOWS:
             holders = win_file_holders(self.target)
             holders.pop(self.me, None)
@@ -370,32 +373,48 @@ class FdHolderJob(Job):
             if pids:
                 self.starts = holders
         else:
-            pids = self._proc_holders()
+            pids = set() if full else self._known_holders()
+            if not pids:
+                pids = self._proc_holders()
         if pids:
             self.seen = True
             self.pids = pids
         return bool(pids)
 
-    def _proc_holders(self) -> set[int]:
-        pids = set()
-        for fd_dir in Path("/proc").glob("[0-9]*/fd"):
-            pid = int(fd_dir.parent.name)
-            if pid == self.me:
-                continue
+    def _known_holders(self) -> set[int]:
+        """The holders from the last full scan that still have the file on the same fd: one
+        readlink each. The full scan reads every fd on the box, ~2.4 s of CPU on truthful-1
+        (311k fds, 2026-10-23), so it runs only when none of these is left."""
+        for pid, fd in list(self.fds.items()):
             try:
-                for fd in fd_dir.iterdir():
-                    try:
-                        if os.readlink(fd) == self.target:
-                            pids.add(pid)
-                            flags = fd_flags(pid, fd.name)
-                            if flags is not None and flags & O_APPEND:
-                                self.appends = True
-                            break
-                    except OSError:
-                        continue
+                held = os.readlink(f"/proc/{pid}/fd/{fd}") == self.target
+            except OSError:
+                held = False
+            if not held:
+                del self.fds[pid]
+        return set(self.fds)
+
+    def _proc_holders(self) -> set[int]:
+        self.fds = {}
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit() or int(pid) == self.me:
+                continue
+            fd_dir = f"/proc/{pid}/fd/"
+            try:
+                fds = os.listdir(fd_dir)
             except OSError:  # process vanished or not ours
                 continue
-        return pids
+            for fd in fds:
+                try:
+                    if os.readlink(fd_dir + fd) == self.target:
+                        self.fds[int(pid)] = fd
+                        flags = fd_flags(int(pid), fd)
+                        if flags is not None and flags & O_APPEND:
+                            self.appends = True
+                        break
+                except OSError:
+                    continue
+        return set(self.fds)
 
     def describe(self) -> str:
         return f"pid {min(self.pids)}" if self.pids else "no process holds the file"
@@ -481,6 +500,14 @@ class PidJob(Job):
         return [self.pid]
 
 
+def proc_cmdline(pid: int) -> bytes | None:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def ancestors(pid: int) -> set[int]:
     if WINDOWS:
         parents, out = win_processes(), set()
@@ -508,14 +535,22 @@ class PgrepJob(Job):
     def __init__(self, pattern: str):
         self.pattern = pattern
         self.exclude = {os.getpid()} | ancestors(os.getpid())
+        self.cmdlines: dict[int, bytes] = {}  # pid -> its command line when pgrep last matched it
 
     def alive(self) -> bool:
         if WINDOWS:
             rx = re.compile(self.pattern)
             pids = {p for p in win_processes() if p not in self.exclude and rx.search(win_cmdline(p) or "")}
         else:
-            out = subprocess.run(["pgrep", "-f", self.pattern], capture_output=True, text=True).stdout
-            pids = {int(p) for p in out.split() if p.strip()} - self.exclude
+            # pgrep reads every process's cmdline (~70 ms of CPU per call with 1000 processes, 1.5%
+            # of a core at one call per 5 s), so its verdict is reused while a matched process still
+            # has the same command line; a zombie's reads empty and sends us back to pgrep.
+            self.cmdlines = {p: c for p, c in self.cmdlines.items() if proc_cmdline(p) == c}
+            pids = set(self.cmdlines)
+            if not pids:
+                out = subprocess.run(["pgrep", "-f", self.pattern], capture_output=True, text=True).stdout
+                pids = {int(p) for p in out.split() if p.strip()} - self.exclude
+                self.cmdlines = {p: c for p in pids if (c := proc_cmdline(p))}
         if pids:
             self.seen = True
         return bool(pids)
@@ -943,9 +978,9 @@ class Watcher:
                     return 3
             now = time.monotonic()
             if now >= next_job_check and self.job.kind != "none":
-                job_alive = self.job.alive()
-                next_job_check = now + a.check_every
                 trailer = self.job.kind == "fd-holder" and self.harness_exit is not None
+                job_alive = self.job.alive(full=True) if trailer else self.job.alive()
+                next_job_check = now + a.check_every
                 orphans = sorted(self.job.pids) if trailer and job_alive else []
                 if self.job.seen and (not job_alive or trailer):
                     if f:
