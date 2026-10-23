@@ -406,8 +406,9 @@ Tests: `test_harness_exit_trailer_ends_the_watch_despite_orphans`,
 
 Each running watcher used 22-42% of a core (5 at once ≈ 1.75 cores on truthful-1). Cause:
 `FdHolderJob.alive()` ran every `--check-every` (5 s) and each call did a full
-`/proc/*/fd` scan, one `readlink` per open fd on the box. truthful-1 had 311k fds open,
-~250k of them held by 152 `mcp-repl` processes with ~6k fds each, so one scan cost ~2.4 s
+`/proc/*/fd` scan, one `readlink` per open fd on the box. truthful-1 had ~300k fds open,
+295k of them held by 152 `mcp-repl` processes (the largest ~6k each, mostly leaked
+`/proc/N/stat` and `/proc/N/task/N/stat` handles), so one scan cost ~2.4 s
 of CPU, mostly kernel time, and took 3-10 s of wall time on a loaded box. The cost scales
 with the fds open on the whole box, not with the job, so it went unnoticed while that number
 was small. Rewriting
