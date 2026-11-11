@@ -180,9 +180,9 @@ def test_hint_ignores_heredocs_quotes_and_file_writers(tmp_path):
     assert 'bgwatch babc123"' in ctx, ctx
     # `cat > run.py <<EOF` writes the script; the job's own log comes after it
     ctx = hint_for("cat > run.py <<'EOF'\nprint(1 > 0)\nEOF\npython run.py > logs/run.log 2>&1", tmp_path)
-    assert 'bgwatch logs/run.log"' in ctx, ctx
+    assert f'bgwatch {(tmp_path / "logs/run.log").as_posix()}"' in ctx, ctx
     ctx = hint_for('python train.py > "logs/train.log" 2>&1', tmp_path)
-    assert 'bgwatch logs/train.log"' in ctx, ctx
+    assert f'bgwatch {(tmp_path / "logs/train.log").as_posix()}"' in ctx, ctx
 
 
 def test_hint_expands_variables_set_in_the_command(tmp_path):
@@ -209,8 +209,9 @@ def test_full_hint_once_per_session_then_one_line(tmp_path):
     first = call_hook(tmp_path, "python a.py", session="s1", task="bfirst001")
     assert "bgwatch wakes you for failure lines" in first and "one-line hint" in first
     second = call_hook(tmp_path, "python b.py > logs/b.log 2>&1", session="s1", task="bsecond02")
-    assert second.count("\n") == 0 and len(second) < 250, second
-    assert 'Monitor(command="bgwatch logs/b.log"' in second and "the job's own log, not the task file" in second
+    log = (tmp_path / "logs/b.log").as_posix()
+    assert second.count("\n") == 0 and len(second) < 250 + len(log), second
+    assert f'Monitor(command="bgwatch {log}"' in second and "the job's own log, not the task file" in second
     assert "bgwatch wakes you" in call_hook(tmp_path, "python c.py", session="s2", task="bthird003")  # a new session
 
 

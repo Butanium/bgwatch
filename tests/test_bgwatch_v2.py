@@ -105,7 +105,8 @@ def test_hint_names_redirect_target(tmp_path):
     }
     p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True, env=hook_env(tmp_path))
     ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert 'bgwatch sub/logs/train.log"' in ctx, ctx  # cwd-relative: fewer tokens to retype
+    # absolute: a cwd-relative path breaks when the shell has `cd`'d away by the time the Monitor is armed
+    assert f'bgwatch {(tmp_path / "sub/logs/train.log").as_posix()}"' in ctx, ctx
     assert "bgwatch babc123" in ctx  # the harness file is still offered, by id
     assert "no --pid/--pgrep needed" in ctx  # default detection is explained, --pgrep is not suggested
     # no redirect → the harness task output file is the target

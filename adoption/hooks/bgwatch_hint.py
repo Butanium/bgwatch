@@ -204,10 +204,10 @@ def watch_target(command: str, cwd: str, task_id: str) -> tuple[str, str, str | 
     """(what to pass bgwatch, kind, raw redirect text); kind is task / redirect / unresolved."""
     log, raw = redirect_target(command, cwd)
     if log:
-        rel = log if os.name == "nt" and log.startswith("/") else os.path.relpath(log, cwd)
-        watch = rel if not rel.startswith("..") else log
-        # the Monitor command runs in bash, which eats unquoted backslashes
-        return (watch.replace("\\", "/") if os.name == "nt" else watch), "redirect", raw
+        # Absolute, not relative to `cwd`: the Monitor runs in whatever directory the shell is in
+        # when it is armed, and a `cd` since the launch makes bgwatch wait for a file that isn't there.
+        # The Monitor command runs in bash, which eats unquoted backslashes.
+        return (log.replace("\\", "/") if os.name == "nt" else log), "redirect", raw
     if raw:
         return f"<absolute path of {raw}>", "unresolved", raw
     return task_id, "task", None
